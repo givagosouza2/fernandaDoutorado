@@ -84,7 +84,7 @@ def run_lda(df, features, target_col, title="LDA"):
         return
 
     min_n = pd.Series(y).value_counts().min()
-    cv_n = min(5, min_n)
+    cv_n = min(10, min_n)
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
