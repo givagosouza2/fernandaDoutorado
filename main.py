@@ -2,6 +2,13 @@ import streamlit as st
 import pandas as pd
 from statsmodels.multivariate.manova import MANOVA
 
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_score
+import matplotlib.pyplot as plt
+import numpy as np
+
+
 st.set_page_config(page_title="MANOVA - Equilíbrio", layout="wide")
 
 st.title("MANOVA - Controle postural")
@@ -148,3 +155,99 @@ if file_oe is not None and file_ce is not None:
 
 else:
     st.info("Envie os dois arquivos para iniciar a análise.")
+
+st.subheader("LDA - Classificação dos grupos")
+
+if st.button("Rodar LDA"):
+
+    X = analysis_df[dependent_vars].values
+    y = analysis_df[group_col].values
+
+    # Padronização (ESSENCIAL)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    lda = LinearDiscriminantAnalysis()
+    X_lda = lda.fit_transform(X_scaled, y)
+
+    # -----------------------------
+    # Acurácia com validação cruzada
+    # -----------------------------
+    scores = cross_val_score(lda, X_scaled, y, cv=5)
+
+    st.write("Acurácia média (5-fold CV):", np.mean(scores))
+    st.write("Desvio padrão:", np.std(scores))
+
+    # -----------------------------
+    # Gráfico LDA
+    # -----------------------------
+    fig, ax = plt.subplots()
+
+    for group in np.unique(y):
+        idx = y == group
+        ax.scatter(
+            X_lda[idx, 0],
+            np.zeros_like(X_lda[idx, 0]),
+            label=f"Grupo {group}",
+            alpha=0.7
+        )
+
+    ax.set_xlabel("LD1")
+    ax.set_title("Separação dos grupos - LDA")
+    ax.legend()
+
+    st.pyplot(fig)
+
+    # -----------------------------
+    # Importância das variáveis
+    # -----------------------------
+    coef = lda.coef_[0]
+
+    importance_df = pd.DataFrame({
+        "Variável": dependent_vars,
+        "Peso LDA": coef
+    }).sort_values(by="Peso LDA", key=abs, ascending=False)
+
+    st.subheader("Importância das variáveis")
+    st.dataframe(importance_df)
+
+st.subheader("LDA por condição")
+
+for cond in ["OE", "CE"]:
+
+    st.write(f"### Condição: {cond}")
+
+    df_cond = analysis_df[analysis_df["Condition"] == cond]
+
+    X = df_cond[dependent_vars].values
+    y = df_cond[group_col].values
+
+    if len(np.unique(y)) < 2:
+        st.warning("Não há grupos suficientes para LDA nesta condição")
+        continue
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    lda = LinearDiscriminantAnalysis()
+    scores = cross_val_score(lda, X_scaled, y, cv=5)
+
+    st.write("Acurácia:", np.mean(scores))
+
+    X_lda = lda.fit_transform(X_scaled, y)
+
+    fig, ax = plt.subplots()
+
+    for group in np.unique(y):
+        idx = y == group
+        ax.scatter(
+            X_lda[idx, 0],
+            np.zeros_like(X_lda[idx, 0]),
+            label=f"Grupo {group}",
+            alpha=0.7
+        )
+
+    ax.set_title(f"LDA - {cond}")
+    ax.legend()
+
+    st.pyplot(fig)
