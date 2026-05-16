@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.metrics import (
     accuracy_score,
@@ -28,20 +28,16 @@ from sklearn.naive_bayes import GaussianNB
 # ============================================================
 
 st.set_page_config(
-    page_title="Pipeline ML - HIV vs Controle",
+    page_title="Pipeline ML Modular - HIV vs Controle",
     layout="wide"
 )
 
-st.title("Pipeline de Aprendizado de Máquina - Controle Postural")
-
+st.title("Pipeline Modular de Aprendizado de Máquina")
 st.write(
     """
-Este aplicativo compara diferentes algoritmos de aprendizado de máquina para
-classificar participantes em grupos, usando variáveis posturais obtidas em
-condições de olhos abertos e olhos fechados.
-
-A normalização é feita **dentro da validação cruzada**, evitando vazamento de
-informação entre treino e teste.
+Este aplicativo executa as análises de classificação em blocos menores.
+Você pode escolher um algoritmo e um ou mais conjuntos de variáveis por vez,
+evitando que o Streamlit reinicie durante análises muito longas.
 """
 )
 
@@ -175,51 +171,48 @@ def build_feature_sets(wide_df, original_features):
     if len(oe_features) > 0 and len(ce_features) > 0:
         feature_sets["OE + CE"] = oe_features + ce_features
 
+    final_df = wide_df.copy()
+
     # Delta CE - OE
-    delta_df = wide_df.copy()
     delta_features = []
 
     for feature in original_features:
         oe_col = f"{feature}__OE"
         ce_col = f"{feature}__CE"
 
-        if oe_col in wide_df.columns and ce_col in wide_df.columns:
+        if oe_col in final_df.columns and ce_col in final_df.columns:
             delta_col = f"Delta__{feature}"
-            delta_df[delta_col] = wide_df[ce_col] - wide_df[oe_col]
+            final_df[delta_col] = final_df[ce_col] - final_df[oe_col]
             delta_features.append(delta_col)
 
     if len(delta_features) > 0:
         feature_sets["Delta CE - OE"] = delta_features
 
     # Razão CE/OE
-    ratio_df = delta_df.copy()
     ratio_features = []
 
     for feature in original_features:
         oe_col = f"{feature}__OE"
         ce_col = f"{feature}__CE"
 
-        if oe_col in wide_df.columns and ce_col in wide_df.columns:
+        if oe_col in final_df.columns and ce_col in final_df.columns:
             ratio_col = f"Ratio__{feature}"
-            denominator = wide_df[oe_col].replace(0, np.nan)
-            ratio_df[ratio_col] = wide_df[ce_col] / denominator
+            denominator = final_df[oe_col].replace(0, np.nan)
+            final_df[ratio_col] = final_df[ce_col] / denominator
             ratio_features.append(ratio_col)
 
-    ratio_df = ratio_df.replace([np.inf, -np.inf], np.nan)
+    final_df = final_df.replace([np.inf, -np.inf], np.nan)
 
     if len(ratio_features) > 0:
         feature_sets["Razão CE/OE"] = ratio_features
 
-    # OE + CE + Delta
     if len(oe_features) > 0 and len(ce_features) > 0 and len(delta_features) > 0:
         feature_sets["OE + CE + Delta"] = oe_features + ce_features + delta_features
-
-    final_df = ratio_df.copy()
 
     return final_df, feature_sets
 
 
-def get_algorithms(random_state=42):
+def get_algorithm(name, random_state=42):
     algorithms = {
         "LDA": LinearDiscriminantAnalysis(
             solver="lsqr",
@@ -248,7 +241,7 @@ def get_algorithms(random_state=42):
         ),
 
         "Random Forest": RandomForestClassifier(
-            n_estimators=500,
+            n_estimators=300,
             class_weight="balanced",
             random_state=random_state
         ),
@@ -264,7 +257,7 @@ def get_algorithms(random_state=42):
         "Naive Bayes": GaussianNB()
     }
 
-    return algorithms
+    return algorithms[name]
 
 
 def compute_binary_metrics(y_true, y_pred, y_score, positive_label):
@@ -303,7 +296,7 @@ def compute_binary_metrics(y_true, y_pred, y_score, positive_label):
     }
 
 
-def bootstrap_ci(values, n_bootstrap=1000, ci=95, random_state=42):
+def bootstrap_ci(values, n_bootstrap=500, ci=95, random_state=42):
     values = np.array(values)
     values = values[~np.isnan(values)]
 
@@ -318,7 +311,6 @@ def bootstrap_ci(values, n_bootstrap=1000, ci=95, random_state=42):
         boot_means.append(np.mean(sample))
 
     alpha = (100 - ci) / 2
-
     lower = np.percentile(boot_means, alpha)
     upper = np.percentile(boot_means, 100 - alpha)
 
@@ -331,8 +323,8 @@ def evaluate_model_repeated_cv(
     model,
     positive_label,
     n_splits=5,
-    n_repeats=50,
-    n_bootstrap=1000,
+    n_repeats=10,
+    n_bootstrap=500,
     random_state=42
 ):
     pipeline = Pipeline([
@@ -350,7 +342,6 @@ def evaluate_model_repeated_cv(
 
     all_y_true = []
     all_y_pred = []
-    all_y_score = []
 
     for train_idx, test_idx in cv.split(X, y):
         X_train = X[train_idx]
@@ -365,23 +356,20 @@ def evaluate_model_repeated_cv(
 
         y_score = None
 
-        if hasattr(pipeline.named_steps["model"], "predict_proba"):
-            try:
+        try:
+            if hasattr(pipeline.named_steps["model"], "predict_proba"):
                 proba = pipeline.predict_proba(X_test)
                 classes = pipeline.named_steps["model"].classes_
 
                 if positive_label in classes:
                     pos_index = list(classes).index(positive_label)
                     y_score = proba[:, pos_index]
-            except Exception:
-                y_score = None
 
-        elif hasattr(pipeline.named_steps["model"], "decision_function"):
-            try:
-                score = pipeline.decision_function(X_test)
-                y_score = score
-            except Exception:
-                y_score = None
+            elif hasattr(pipeline.named_steps["model"], "decision_function"):
+                y_score = pipeline.decision_function(X_test)
+
+        except Exception:
+            y_score = None
 
         metrics = compute_binary_metrics(
             y_true=y_test,
@@ -395,11 +383,6 @@ def evaluate_model_repeated_cv(
         all_y_true.extend(y_test)
         all_y_pred.extend(y_pred)
 
-        if y_score is not None:
-            all_y_score.extend(y_score)
-        else:
-            all_y_score.extend([np.nan] * len(y_test))
-
     metrics_df = pd.DataFrame(fold_metrics)
 
     summary = {}
@@ -407,8 +390,8 @@ def evaluate_model_repeated_cv(
     for metric in ["accuracy", "balanced_accuracy", "sensitivity", "specificity", "f1", "auc"]:
         values = metrics_df[metric].values
 
-        mean_value = np.nanmean(values)
-        sd_value = np.nanstd(values)
+        summary[f"{metric}_mean"] = np.nanmean(values)
+        summary[f"{metric}_sd"] = np.nanstd(values)
 
         ci_low, ci_high = bootstrap_ci(
             values,
@@ -417,19 +400,14 @@ def evaluate_model_repeated_cv(
             random_state=random_state
         )
 
-        summary[f"{metric}_mean"] = mean_value
-        summary[f"{metric}_sd"] = sd_value
         summary[f"{metric}_ci95_low"] = ci_low
         summary[f"{metric}_ci95_high"] = ci_high
-
-    all_y_true = np.array(all_y_true)
-    all_y_pred = np.array(all_y_pred)
 
     labels = np.unique(y)
 
     cm = confusion_matrix(
-        all_y_true,
-        all_y_pred,
+        np.array(all_y_true),
+        np.array(all_y_pred),
         labels=labels
     )
 
@@ -475,7 +453,7 @@ def fit_final_model_and_importance(X, y, feature_names, model):
             "Importância": importance
         }).sort_values("Importância", ascending=False)
 
-    return pipeline, importance_df
+    return importance_df
 
 
 # ============================================================
@@ -563,7 +541,6 @@ if len(set([id_col, group_col, condition_col])) < 3:
 st.header("3. Seleção das variáveis posturais")
 
 numeric_cols = df.select_dtypes(include="number").columns.tolist()
-
 exclude_cols = [id_col, group_col, condition_col]
 
 available_features = [
@@ -585,59 +562,12 @@ if len(selected_features) == 0:
     st.warning("Selecione pelo menos uma variável.")
     st.stop()
 
-st.write("Variáveis selecionadas:")
-st.write(selected_features)
-
-
-# ============================================================
-# Configuração da validação
-# ============================================================
-
-st.header("4. Configuração da validação")
-
-col_cv1, col_cv2, col_cv3 = st.columns(3)
-
-with col_cv1:
-    n_splits = st.number_input(
-        "Número de folds",
-        min_value=2,
-        max_value=10,
-        value=5,
-        step=1
-    )
-
-with col_cv2:
-    n_repeats = st.number_input(
-        "Número de repetições",
-        min_value=1,
-        max_value=200,
-        value=50,
-        step=1
-    )
-
-with col_cv3:
-    n_bootstrap = st.number_input(
-        "Número de reamostragens bootstrap",
-        min_value=100,
-        max_value=5000,
-        value=1000,
-        step=100
-    )
-
-random_state = st.number_input(
-    "Random state",
-    min_value=0,
-    max_value=9999,
-    value=42,
-    step=1
-)
-
 
 # ============================================================
 # Preparação dos dados
 # ============================================================
 
-st.header("5. Preparação dos dados")
+st.header("4. Preparação dos dados")
 
 df_work = df.copy()
 df_work[condition_col] = df_work[condition_col].apply(normalize_condition_label)
@@ -675,297 +605,303 @@ wide_df = create_wide_dataframe(
     feature_cols=selected_features
 )
 
-st.subheader("Base em formato largo")
-safe_dataframe(wide_df, n_rows=20)
-
-st.write(f"Número de participantes na base larga: **{wide_df.shape[0]}**")
-
 wide_complete_df, feature_sets = build_feature_sets(
     wide_df=wide_df,
     original_features=selected_features
 )
 
-st.subheader("Conjuntos de variáveis criados")
+st.subheader("Base em formato largo")
+safe_dataframe(wide_complete_df, n_rows=20)
+
+st.write(f"Número de participantes na base larga: **{wide_complete_df.shape[0]}**")
 
 feature_set_summary = pd.DataFrame({
     "Conjunto": list(feature_sets.keys()),
     "Número de variáveis": [len(v) for v in feature_sets.values()]
 })
 
+st.subheader("Conjuntos de variáveis disponíveis")
 safe_dataframe(feature_set_summary)
 
-if len(feature_sets) == 0:
-    st.error("Nenhum conjunto de variáveis pôde ser criado.")
+
+# ============================================================
+# Escolha modular da análise
+# ============================================================
+
+st.header("5. Escolha da análise")
+
+algorithm_name = st.selectbox(
+    "Escolha o algoritmo",
+    [
+        "LDA",
+        "Regressão logística",
+        "SVM linear",
+        "SVM RBF",
+        "Random Forest",
+        "Gradient Boosting",
+        "KNN",
+        "Naive Bayes"
+    ]
+)
+
+selected_feature_sets = st.multiselect(
+    "Escolha os conjuntos de variáveis a testar",
+    list(feature_sets.keys()),
+    default=["OE", "CE", "Delta CE - OE"] if "Delta CE - OE" in feature_sets else list(feature_sets.keys())[:1]
+)
+
+if len(selected_feature_sets) == 0:
+    st.warning("Selecione pelo menos um conjunto de variáveis.")
     st.stop()
 
 
 # ============================================================
-# Rodar análise
+# Configuração leve da validação
 # ============================================================
 
-st.header("6. Rodar comparação dos algoritmos")
+st.header("6. Configuração da validação")
+
+col_cv1, col_cv2, col_cv3 = st.columns(3)
+
+with col_cv1:
+    n_splits = st.number_input(
+        "Número de folds",
+        min_value=2,
+        max_value=10,
+        value=5,
+        step=1
+    )
+
+with col_cv2:
+    n_repeats = st.number_input(
+        "Número de repetições",
+        min_value=1,
+        max_value=100,
+        value=10,
+        step=1
+    )
+
+with col_cv3:
+    n_bootstrap = st.number_input(
+        "Bootstrap para IC95%",
+        min_value=100,
+        max_value=3000,
+        value=500,
+        step=100
+    )
+
+random_state = st.number_input(
+    "Random state",
+    min_value=0,
+    max_value=9999,
+    value=42,
+    step=1
+)
+
+
+# ============================================================
+# Rodar análise escolhida
+# ============================================================
+
+st.header("7. Rodar análise modular")
 
 st.write(
-    """
-Para cada conjunto de variáveis, todos os algoritmos serão avaliados usando:
+    f"""
+Configuração atual:
 
-- normalização dentro do pipeline;
-- validação cruzada estratificada repetida;
-- intervalo de confiança bootstrap das métricas.
+- Algoritmo: **{algorithm_name}**
+- Conjuntos selecionados: **{", ".join(selected_feature_sets)}**
+- Validação: **{n_splits} folds × {n_repeats} repetições**
+- Bootstrap: **{n_bootstrap} reamostragens**
 """
 )
 
-run_analysis = st.button("Rodar pipeline completo")
+if st.button("Rodar análise selecionada"):
 
-if run_analysis:
+    algorithm = get_algorithm(
+        name=algorithm_name,
+        random_state=int(random_state)
+    )
 
-    algorithms = get_algorithms(random_state=int(random_state))
-
-    all_results = []
-    detailed_metrics = {}
-    confusion_matrices = {}
-    importances = {}
+    all_results = {}
+    summary_rows = []
 
     progress_bar = st.progress(0)
-    status_text = st.empty()
 
-    total_runs = len(feature_sets) * len(algorithms)
-    current_run = 0
+    for i, feature_set_name in enumerate(selected_feature_sets):
 
-    for feature_set_name, features in feature_sets.items():
+        progress_bar.progress((i + 1) / len(selected_feature_sets))
+
+        st.markdown("---")
+        st.subheader(f"Conjunto: {feature_set_name}")
+
+        features = feature_sets[feature_set_name]
 
         model_df = wide_complete_df[[group_col] + features].copy()
         model_df = model_df.replace([np.inf, -np.inf], np.nan)
         model_df = model_df.dropna()
 
-        if model_df.shape[0] < 4:
-            st.warning(f"Conjunto {feature_set_name}: poucos participantes após remoção de ausentes.")
+        st.write(f"N participantes usados: **{model_df.shape[0]}**")
+        st.write(f"N variáveis usadas: **{len(features)}**")
+
+        group_count_model = model_df[group_col].astype(str).value_counts()
+        group_count_df = group_count_model.reset_index()
+        group_count_df.columns = ["Grupo", "n"]
+        safe_dataframe(group_count_df)
+
+        if group_count_model.min() < n_splits:
+            st.warning(
+                f"O menor grupo tem {group_count_model.min()} participantes. "
+                f"Reduza o número de folds."
+            )
             continue
 
         X = model_df[features].astype(float).to_numpy()
         y = model_df[group_col].astype(str).to_numpy()
 
-        group_count_model = pd.Series(y).value_counts()
-
-        if group_count_model.min() < n_splits:
-            st.warning(
-                f"Conjunto {feature_set_name}: o menor grupo tem {group_count_model.min()} participantes. "
-                f"Reduza o número de folds."
-            )
-            continue
-
-        for algorithm_name, algorithm in algorithms.items():
-
-            current_run += 1
-            progress_bar.progress(current_run / total_runs)
-
-            status_text.write(
-                f"Rodando: {feature_set_name} | {algorithm_name}"
-            )
-
-            try:
-                summary, metrics_df, cm_df = evaluate_model_repeated_cv(
-                    X=X,
-                    y=y,
-                    model=algorithm,
-                    positive_label=positive_label,
-                    n_splits=int(n_splits),
-                    n_repeats=int(n_repeats),
-                    n_bootstrap=int(n_bootstrap),
-                    random_state=int(random_state)
-                )
-
-                result_row = {
-                    "Conjunto": feature_set_name,
-                    "Algoritmo": algorithm_name,
-                    "N participantes": model_df.shape[0],
-                    "N variáveis": len(features),
-                    "Balanced accuracy média": summary["balanced_accuracy_mean"],
-                    "Balanced accuracy DP": summary["balanced_accuracy_sd"],
-                    "Balanced accuracy IC95% inferior": summary["balanced_accuracy_ci95_low"],
-                    "Balanced accuracy IC95% superior": summary["balanced_accuracy_ci95_high"],
-                    "Acurácia média": summary["accuracy_mean"],
-                    "Sensibilidade média": summary["sensitivity_mean"],
-                    "Especificidade média": summary["specificity_mean"],
-                    "F1 médio": summary["f1_mean"],
-                    "AUC média": summary["auc_mean"],
-                    "AUC IC95% inferior": summary["auc_ci95_low"],
-                    "AUC IC95% superior": summary["auc_ci95_high"]
-                }
-
-                all_results.append(result_row)
-
-                key = f"{feature_set_name} | {algorithm_name}"
-                detailed_metrics[key] = metrics_df
-                confusion_matrices[key] = cm_df
-
-                final_pipeline, importance_df = fit_final_model_and_importance(
-                    X=X,
-                    y=y,
-                    feature_names=features,
-                    model=algorithm
-                )
-
-                if importance_df is not None:
-                    importances[key] = importance_df
-
-            except Exception as e:
-                st.error(f"Erro em {feature_set_name} | {algorithm_name}")
-                st.exception(e)
-
-    progress_bar.progress(1.0)
-    status_text.write("Análise finalizada.")
-
-    if len(all_results) == 0:
-        st.error("Nenhum modelo foi avaliado com sucesso.")
-        st.stop()
-
-    results_df = pd.DataFrame(all_results)
-
-    results_df = results_df.sort_values(
-        by="Balanced accuracy média",
-        ascending=False
-    )
-
-    st.header("7. Ranking dos modelos")
-
-    safe_dataframe(results_df)
-
-    best_row = results_df.iloc[0]
-
-    st.success(
-        f"Melhor modelo: {best_row['Conjunto']} | {best_row['Algoritmo']} "
-        f"com balanced accuracy média = {best_row['Balanced accuracy média']:.3f}"
-    )
-
-    # ========================================================
-    # Gráfico dos melhores modelos
-    # ========================================================
-
-    st.subheader("Top 15 modelos por balanced accuracy")
-
-    top_df = results_df.head(15).copy()
-    top_df["Modelo"] = top_df["Conjunto"] + " | " + top_df["Algoritmo"]
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-
-    ax.barh(
-        top_df["Modelo"][::-1],
-        top_df["Balanced accuracy média"][::-1]
-    )
-
-    ax.set_xlabel("Balanced accuracy média")
-    ax.set_title("Top 15 modelos")
-    ax.set_xlim(0, 1)
-    ax.grid(axis="x", alpha=0.3)
-
-    st.pyplot(fig)
-
-    # ========================================================
-    # Detalhes do melhor modelo
-    # ========================================================
-
-    st.header("8. Detalhes do melhor modelo")
-
-    best_key = f"{best_row['Conjunto']} | {best_row['Algoritmo']}"
-
-    st.subheader("Métricas por fold/repetição do melhor modelo")
-    safe_dataframe(detailed_metrics[best_key])
-
-    st.subheader("Matriz de confusão acumulada do melhor modelo")
-    safe_dataframe(confusion_matrices[best_key])
-
-    if best_key in importances:
-        st.subheader("Importância das variáveis no melhor modelo")
-        safe_dataframe(importances[best_key])
-
-        top_imp = importances[best_key].head(20).copy()
-
-        fig2, ax2 = plt.subplots(figsize=(10, 6))
-
-        ax2.barh(
-            top_imp["Variável"][::-1],
-            top_imp["Importância"][::-1]
+        summary, metrics_df, cm_df = evaluate_model_repeated_cv(
+            X=X,
+            y=y,
+            model=algorithm,
+            positive_label=positive_label,
+            n_splits=int(n_splits),
+            n_repeats=int(n_repeats),
+            n_bootstrap=int(n_bootstrap),
+            random_state=int(random_state)
         )
 
-        ax2.set_xlabel("Importância")
-        ax2.set_title("Principais variáveis do melhor modelo")
+        row = {
+            "Algoritmo": algorithm_name,
+            "Conjunto": feature_set_name,
+            "N participantes": model_df.shape[0],
+            "N variáveis": len(features),
+            "Balanced accuracy média": summary["balanced_accuracy_mean"],
+            "Balanced accuracy DP": summary["balanced_accuracy_sd"],
+            "Balanced accuracy IC95% inferior": summary["balanced_accuracy_ci95_low"],
+            "Balanced accuracy IC95% superior": summary["balanced_accuracy_ci95_high"],
+            "Acurácia média": summary["accuracy_mean"],
+            "Sensibilidade média": summary["sensitivity_mean"],
+            "Especificidade média": summary["specificity_mean"],
+            "F1 médio": summary["f1_mean"],
+            "AUC média": summary["auc_mean"],
+            "AUC IC95% inferior": summary["auc_ci95_low"],
+            "AUC IC95% superior": summary["auc_ci95_high"]
+        }
+
+        summary_rows.append(row)
+
+        st.write("Resumo do desempenho:")
+        safe_dataframe(pd.DataFrame([row]))
+
+        st.write("Matriz de confusão acumulada:")
+        safe_dataframe(cm_df)
+
+        importance_df = fit_final_model_and_importance(
+            X=X,
+            y=y,
+            feature_names=features,
+            model=algorithm
+        )
+
+        if importance_df is not None:
+            st.write("Importância das variáveis:")
+            safe_dataframe(importance_df)
+
+            top_imp = importance_df.head(20)
+
+            fig, ax = plt.subplots(figsize=(9, 5))
+            ax.barh(
+                top_imp["Variável"][::-1],
+                top_imp["Importância"][::-1]
+            )
+            ax.set_xlabel("Importância")
+            ax.set_title(f"Variáveis mais importantes - {feature_set_name}")
+            ax.grid(axis="x", alpha=0.3)
+
+            st.pyplot(fig)
+
+        all_results[feature_set_name] = {
+            "summary": row,
+            "metrics": metrics_df,
+            "confusion_matrix": cm_df
+        }
+
+    if len(summary_rows) > 0:
+        summary_df = pd.DataFrame(summary_rows)
+
+        summary_df = summary_df.sort_values(
+            by="Balanced accuracy média",
+            ascending=False
+        )
+
+        st.header("8. Resumo comparativo da rodada")
+        safe_dataframe(summary_df)
+
+        fig2, ax2 = plt.subplots(figsize=(9, 5))
+
+        ax2.barh(
+            summary_df["Conjunto"][::-1],
+            summary_df["Balanced accuracy média"][::-1]
+        )
+
+        ax2.set_xlabel("Balanced accuracy média")
+        ax2.set_title(f"Comparação dos conjuntos - {algorithm_name}")
+        ax2.set_xlim(0, 1)
         ax2.grid(axis="x", alpha=0.3)
 
         st.pyplot(fig2)
 
-    else:
-        st.info(
-            "Este algoritmo não possui coeficientes ou importâncias diretas "
-            "de variáveis disponíveis."
+        csv_results = summary_df.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="Baixar resultados desta rodada em CSV",
+            data=csv_results,
+            file_name=f"resultados_{algorithm_name.replace(' ', '_')}.csv",
+            mime="text/csv"
         )
 
-    # ========================================================
-    # Download dos resultados
-    # ========================================================
-
-    st.header("9. Exportar resultados")
-
-    csv_results = results_df.to_csv(index=False).encode("utf-8")
-
-    st.download_button(
-        label="Baixar tabela de resultados em CSV",
-        data=csv_results,
-        file_name="resultados_pipeline_ml.csv",
-        mime="text/csv"
-    )
-
 
 # ============================================================
-# Interpretação
+# Orientação
 # ============================================================
 
-st.header("10. Como interpretar")
+st.header("9. Estratégia recomendada")
 
 st.markdown(
     """
-### O que este pipeline responde?
+### Como usar sem travar o Streamlit
 
-Ele responde principalmente:
+Sugestão prática:
 
-> Qual combinação de condição visual, transformação de variáveis e algoritmo
-> separa melhor os grupos?
+1. Primeiro rode com:
+   - 5 folds
+   - 10 repetições
+   - 500 bootstraps
 
----
+2. Teste um algoritmo por vez.
 
-### Interpretação dos conjuntos de variáveis
+3. Comece pelos algoritmos mais rápidos:
+   - LDA
+   - Regressão logística
+   - Naive Bayes
+   - SVM linear
 
-- **OE**: testa se os grupos já se separam com olhos abertos.
-- **CE**: testa se a retirada da visão aumenta a separação.
-- **OE + CE**: testa se as duas condições trazem informação complementar.
-- **Delta CE - OE**: testa se a resposta à retirada da visão separa os grupos.
-- **Razão CE/OE**: testa se a mudança proporcional separa os grupos.
-- **OE + CE + Delta**: combina valores absolutos e mudança funcional.
+4. Depois teste:
+   - Random Forest
+   - Gradient Boosting
+   - SVM RBF
 
----
-
-### Métrica principal
-
-A métrica principal recomendada é a **balanced accuracy**, especialmente se os
-grupos tiverem tamanhos diferentes.
-
----
-
-### Normalização
-
-A normalização é feita dentro do `Pipeline`, ou seja:
-
-1. o scaler é ajustado apenas no treino;
-2. o teste é transformado usando os parâmetros do treino;
-3. o modelo nunca vê informações do teste durante o treinamento.
-
-Isso evita vazamento de informação.
+5. Quando encontrar os melhores candidatos, aumente apenas neles:
+   - 30 ou 50 repetições
+   - 1000 bootstraps
 
 ---
 
-### Bootstrap
+### Interpretação
 
-O bootstrap é usado para estimar a incerteza das métricas de desempenho,
-gerando intervalos de confiança de 95%.
+- Se **CE** superar OE, a retirada da visão aumenta a separação entre grupos.
+- Se **Delta CE - OE** for melhor, a resposta à retirada da visão é mais informativa.
+- Se **OE + CE** for melhor, as condições carregam informação complementar.
+- Se modelos lineares forem tão bons quanto modelos complexos, prefira os lineares pela interpretabilidade.
 """
 )
