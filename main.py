@@ -35,9 +35,12 @@ st.set_page_config(
 st.title("Pipeline Modular de Aprendizado de Máquina")
 st.write(
     """
-Este aplicativo executa as análises de classificação em blocos menores.
+Este aplicativo executa análises de classificação em blocos menores.
 Você pode escolher um algoritmo e um ou mais conjuntos de variáveis por vez,
 evitando que o Streamlit reinicie durante análises muito longas.
+
+A normalização é feita dentro do pipeline de validação cruzada para evitar
+vazamento de informação entre treino e teste.
 """
 )
 
@@ -93,10 +96,26 @@ def sanitize_text(x):
 def normalize_condition_label(x):
     x = sanitize_text(x)
 
-    if x in ["oe", "open", "open eyes", "olhos abertos", "abertos", "eye open", "eyes open"]:
+    if x in [
+        "oe",
+        "open",
+        "open eyes",
+        "olhos abertos",
+        "abertos",
+        "eye open",
+        "eyes open"
+    ]:
         return "OE"
 
-    if x in ["ce", "closed", "closed eyes", "olhos fechados", "fechados", "eye closed", "eyes closed"]:
+    if x in [
+        "ce",
+        "closed",
+        "closed eyes",
+        "olhos fechados",
+        "fechados",
+        "eye closed",
+        "eyes closed"
+    ]:
         return "CE"
 
     return str(x).strip()
@@ -162,6 +181,8 @@ def build_feature_sets(wide_df, original_features):
         if ce_col in wide_df.columns:
             ce_features.append(ce_col)
 
+    final_df = wide_df.copy()
+
     if len(oe_features) > 0:
         feature_sets["OE"] = oe_features
 
@@ -170,8 +191,6 @@ def build_feature_sets(wide_df, original_features):
 
     if len(oe_features) > 0 and len(ce_features) > 0:
         feature_sets["OE + CE"] = oe_features + ce_features
-
-    final_df = wide_df.copy()
 
     # Delta CE - OE
     delta_features = []
@@ -206,6 +225,7 @@ def build_feature_sets(wide_df, original_features):
     if len(ratio_features) > 0:
         feature_sets["Razão CE/OE"] = ratio_features
 
+    # OE + CE + Delta
     if len(oe_features) > 0 and len(ce_features) > 0 and len(delta_features) > 0:
         feature_sets["OE + CE + Delta"] = oe_features + ce_features + delta_features
 
@@ -265,21 +285,41 @@ def compute_binary_metrics(y_true, y_pred, y_score, positive_label):
 
     acc = accuracy_score(y_true, y_pred)
     bal_acc = balanced_accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred, pos_label=positive_label, zero_division=0)
-    sensitivity = recall_score(y_true, y_pred, pos_label=positive_label, zero_division=0)
+
+    f1 = f1_score(
+        y_true,
+        y_pred,
+        pos_label=positive_label,
+        zero_division=0
+    )
+
+    sensitivity = recall_score(
+        y_true,
+        y_pred,
+        pos_label=positive_label,
+        zero_division=0
+    )
 
     negative_labels = [label for label in labels if label != positive_label]
 
     if len(negative_labels) == 1:
         negative_label = negative_labels[0]
-        specificity = recall_score(y_true, y_pred, pos_label=negative_label, zero_division=0)
+
+        specificity = recall_score(
+            y_true,
+            y_pred,
+            pos_label=negative_label,
+            zero_division=0
+        )
     else:
         specificity = np.nan
 
     auc = np.nan
 
     if y_score is not None and len(labels) == 2:
-        y_true_binary = np.array([1 if y == positive_label else 0 for y in y_true])
+        y_true_binary = np.array([
+            1 if y == positive_label else 0 for y in y_true
+        ])
 
         try:
             auc = roc_auc_score(y_true_binary, y_score)
@@ -352,8 +392,13 @@ def evaluate_model_repeated_cv(
 
         pipeline.fit(X_train, y_train)
 
-        y_pred = pipeline.predict(X_test)
+        # Predição no treino
+        y_train_pred = pipeline.predict(X_train)
 
+        # Predição no teste
+        y_test_pred = pipeline.predict(X_test)
+
+        # Scores para AUC no teste
         y_score = None
 
         try:
@@ -371,23 +416,55 @@ def evaluate_model_repeated_cv(
         except Exception:
             y_score = None
 
-        metrics = compute_binary_metrics(
+        # Métricas no treino
+        train_accuracy = accuracy_score(y_train, y_train_pred)
+        train_balanced_accuracy = balanced_accuracy_score(y_train, y_train_pred)
+
+        # Métricas no teste
+        test_metrics = compute_binary_metrics(
             y_true=y_test,
-            y_pred=y_pred,
+            y_pred=y_test_pred,
             y_score=y_score,
             positive_label=positive_label
         )
 
+        metrics = {
+            "train_accuracy": train_accuracy,
+            "train_balanced_accuracy": train_balanced_accuracy,
+
+            "test_accuracy": test_metrics["accuracy"],
+            "test_balanced_accuracy": test_metrics["balanced_accuracy"],
+
+            "generalization_gap_accuracy": train_accuracy - test_metrics["accuracy"],
+            "generalization_gap_balanced_accuracy": train_balanced_accuracy - test_metrics["balanced_accuracy"],
+
+            "sensitivity": test_metrics["sensitivity"],
+            "specificity": test_metrics["specificity"],
+            "f1": test_metrics["f1"],
+            "auc": test_metrics["auc"]
+        }
+
         fold_metrics.append(metrics)
 
         all_y_true.extend(y_test)
-        all_y_pred.extend(y_pred)
+        all_y_pred.extend(y_test_pred)
 
     metrics_df = pd.DataFrame(fold_metrics)
 
     summary = {}
 
-    for metric in ["accuracy", "balanced_accuracy", "sensitivity", "specificity", "f1", "auc"]:
+    for metric in [
+        "train_accuracy",
+        "train_balanced_accuracy",
+        "test_accuracy",
+        "test_balanced_accuracy",
+        "generalization_gap_accuracy",
+        "generalization_gap_balanced_accuracy",
+        "sensitivity",
+        "specificity",
+        "f1",
+        "auc"
+    ]:
         values = metrics_df[metric].values
 
         summary[f"{metric}_mean"] = np.nanmean(values)
@@ -454,6 +531,19 @@ def fit_final_model_and_importance(X, y, feature_names, model):
         }).sort_values("Importância", ascending=False)
 
     return importance_df
+
+
+def classify_overfitting(gap):
+    if pd.isna(gap):
+        return "Não estimado"
+
+    if gap < 0.05:
+        return "Baixo"
+
+    if gap < 0.15:
+        return "Moderado"
+
+    return "Alto"
 
 
 # ============================================================
@@ -644,10 +734,19 @@ algorithm_name = st.selectbox(
     ]
 )
 
+default_sets = []
+
+for name in ["OE", "CE", "Delta CE - OE"]:
+    if name in feature_sets:
+        default_sets.append(name)
+
+if len(default_sets) == 0:
+    default_sets = list(feature_sets.keys())[:1]
+
 selected_feature_sets = st.multiselect(
     "Escolha os conjuntos de variáveis a testar",
     list(feature_sets.keys()),
-    default=["OE", "CE", "Delta CE - OE"] if "Delta CE - OE" in feature_sets else list(feature_sets.keys())[:1]
+    default=default_sets
 )
 
 if len(selected_feature_sets) == 0:
@@ -656,7 +755,7 @@ if len(selected_feature_sets) == 0:
 
 
 # ============================================================
-# Configuração leve da validação
+# Configuração da validação
 # ============================================================
 
 st.header("6. Configuração da validação")
@@ -723,7 +822,6 @@ if st.button("Rodar análise selecionada"):
         random_state=int(random_state)
     )
 
-    all_results = {}
     summary_rows = []
 
     progress_bar = st.progress(0)
@@ -770,22 +868,36 @@ if st.button("Rodar análise selecionada"):
             random_state=int(random_state)
         )
 
+        gap_balanced = summary["generalization_gap_balanced_accuracy_mean"]
+
         row = {
             "Algoritmo": algorithm_name,
             "Conjunto": feature_set_name,
             "N participantes": model_df.shape[0],
             "N variáveis": len(features),
-            "Balanced accuracy média": summary["balanced_accuracy_mean"],
-            "Balanced accuracy DP": summary["balanced_accuracy_sd"],
-            "Balanced accuracy IC95% inferior": summary["balanced_accuracy_ci95_low"],
-            "Balanced accuracy IC95% superior": summary["balanced_accuracy_ci95_high"],
-            "Acurácia média": summary["accuracy_mean"],
-            "Sensibilidade média": summary["sensitivity_mean"],
-            "Especificidade média": summary["specificity_mean"],
-            "F1 médio": summary["f1_mean"],
-            "AUC média": summary["auc_mean"],
-            "AUC IC95% inferior": summary["auc_ci95_low"],
-            "AUC IC95% superior": summary["auc_ci95_high"]
+
+            "Acurácia treino média": summary["train_accuracy_mean"],
+            "Acurácia treino DP": summary["train_accuracy_sd"],
+            "Acurácia teste média": summary["test_accuracy_mean"],
+            "Acurácia teste DP": summary["test_accuracy_sd"],
+            "Gap acurácia treino-teste": summary["generalization_gap_accuracy_mean"],
+
+            "Balanced accuracy treino média": summary["train_balanced_accuracy_mean"],
+            "Balanced accuracy treino DP": summary["train_balanced_accuracy_sd"],
+            "Balanced accuracy teste média": summary["test_balanced_accuracy_mean"],
+            "Balanced accuracy teste DP": summary["test_balanced_accuracy_sd"],
+            "Gap balanced accuracy treino-teste": gap_balanced,
+            "Risco de overfitting": classify_overfitting(gap_balanced),
+
+            "Balanced accuracy teste IC95% inferior": summary["test_balanced_accuracy_ci95_low"],
+            "Balanced accuracy teste IC95% superior": summary["test_balanced_accuracy_ci95_high"],
+
+            "Sensibilidade teste média": summary["sensitivity_mean"],
+            "Especificidade teste média": summary["specificity_mean"],
+            "F1 teste médio": summary["f1_mean"],
+            "AUC teste média": summary["auc_mean"],
+            "AUC teste IC95% inferior": summary["auc_ci95_low"],
+            "AUC teste IC95% superior": summary["auc_ci95_high"]
         }
 
         summary_rows.append(row)
@@ -793,8 +905,11 @@ if st.button("Rodar análise selecionada"):
         st.write("Resumo do desempenho:")
         safe_dataframe(pd.DataFrame([row]))
 
-        st.write("Matriz de confusão acumulada:")
+        st.write("Matriz de confusão acumulada no teste:")
         safe_dataframe(cm_df)
+
+        st.write("Métricas por fold/repetição:")
+        safe_dataframe(metrics_df)
 
         importance_df = fit_final_model_and_importance(
             X=X,
@@ -820,36 +935,93 @@ if st.button("Rodar análise selecionada"):
 
             st.pyplot(fig)
 
-        all_results[feature_set_name] = {
-            "summary": row,
-            "metrics": metrics_df,
-            "confusion_matrix": cm_df
-        }
-
     if len(summary_rows) > 0:
         summary_df = pd.DataFrame(summary_rows)
 
         summary_df = summary_df.sort_values(
-            by="Balanced accuracy média",
+            by="Balanced accuracy teste média",
             ascending=False
         )
 
         st.header("8. Resumo comparativo da rodada")
         safe_dataframe(summary_df)
 
+        # ====================================================
+        # Gráfico: desempenho no teste
+        # ====================================================
+
+        st.subheader("Balanced accuracy no teste")
+
         fig2, ax2 = plt.subplots(figsize=(9, 5))
 
         ax2.barh(
             summary_df["Conjunto"][::-1],
-            summary_df["Balanced accuracy média"][::-1]
+            summary_df["Balanced accuracy teste média"][::-1]
         )
 
-        ax2.set_xlabel("Balanced accuracy média")
+        ax2.set_xlabel("Balanced accuracy no teste")
         ax2.set_title(f"Comparação dos conjuntos - {algorithm_name}")
         ax2.set_xlim(0, 1)
         ax2.grid(axis="x", alpha=0.3)
 
         st.pyplot(fig2)
+
+        # ====================================================
+        # Gráfico: treino versus teste
+        # ====================================================
+
+        st.subheader("Comparação treino versus teste")
+
+        plot_df = summary_df.copy()
+        plot_df["Modelo"] = plot_df["Conjunto"]
+
+        x = np.arange(len(plot_df))
+        width = 0.35
+
+        fig3, ax3 = plt.subplots(figsize=(10, 5))
+
+        ax3.bar(
+            x - width / 2,
+            plot_df["Balanced accuracy treino média"],
+            width,
+            label="Treino"
+        )
+
+        ax3.bar(
+            x + width / 2,
+            plot_df["Balanced accuracy teste média"],
+            width,
+            label="Teste"
+        )
+
+        ax3.set_ylabel("Balanced accuracy")
+        ax3.set_title(f"Treino versus teste - {algorithm_name}")
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(plot_df["Modelo"], rotation=45, ha="right")
+        ax3.set_ylim(0, 1)
+        ax3.legend()
+        ax3.grid(axis="y", alpha=0.3)
+
+        st.pyplot(fig3)
+
+        # ====================================================
+        # Gráfico: gap treino-teste
+        # ====================================================
+
+        st.subheader("Gap treino - teste")
+
+        fig4, ax4 = plt.subplots(figsize=(9, 5))
+
+        ax4.barh(
+            summary_df["Conjunto"][::-1],
+            summary_df["Gap balanced accuracy treino-teste"][::-1]
+        )
+
+        ax4.set_xlabel("Gap de balanced accuracy")
+        ax4.set_title(f"Possível overfitting - {algorithm_name}")
+        ax4.grid(axis="x", alpha=0.3)
+
+        st.pyplot(fig4)
 
         csv_results = summary_df.to_csv(index=False).encode("utf-8")
 
@@ -897,11 +1069,51 @@ Sugestão prática:
 
 ---
 
-### Interpretação
+### Interpretação do desempenho
 
-- Se **CE** superar OE, a retirada da visão aumenta a separação entre grupos.
-- Se **Delta CE - OE** for melhor, a resposta à retirada da visão é mais informativa.
-- Se **OE + CE** for melhor, as condições carregam informação complementar.
-- Se modelos lineares forem tão bons quanto modelos complexos, prefira os lineares pela interpretabilidade.
+A métrica principal recomendada é:
+
+`Balanced accuracy teste média`
+
+Ela deve ser interpretada junto com:
+
+`Gap balanced accuracy treino-teste`
+
+---
+
+### Interpretação do gap treino-teste
+
+- **Gap < 0.05**: baixo sinal de overfitting.
+- **Gap entre 0.05 e 0.15**: possível overfitting moderado.
+- **Gap > 0.15**: provável overfitting importante.
+
+Exemplo:
+
+`Treino = 0.95` e `Teste = 0.62`
+
+indica que o modelo aprendeu muito bem os dados de treino, mas generalizou mal.
+
+---
+
+### Interpretação dos conjuntos
+
+- **OE**: testa se os grupos já se separam com olhos abertos.
+- **CE**: testa se a retirada da visão aumenta a separação.
+- **Delta CE - OE**: testa se a resposta à retirada da visão separa os grupos.
+- **Razão CE/OE**: testa se a mudança proporcional separa os grupos.
+- **OE + CE**: testa se as duas condições carregam informação complementar.
+
+---
+
+### Recomendação científica
+
+Um modelo ideal não é necessariamente o que tem maior acurácia no treino.
+O melhor modelo deve combinar:
+
+1. boa balanced accuracy no teste;
+2. baixo gap treino-teste;
+3. boa sensibilidade e especificidade;
+4. plausibilidade fisiológica;
+5. interpretabilidade.
 """
 )
