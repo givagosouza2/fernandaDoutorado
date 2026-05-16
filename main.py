@@ -28,6 +28,7 @@ st.set_page_config(
 )
 
 st.title("Controle Postural - Medidas Repetidas e Classificação")
+
 st.write(
     """
 Aplicativo para análise de dados de equilíbrio em duas condições visuais:
@@ -37,7 +38,7 @@ A análise foi organizada em duas partes:
 
 1. **Modelos mistos**, considerando que OE e CE são medidas repetidas do mesmo participante.
 2. **Modelos classificatórios**, comparando a capacidade de separar HIV e controles usando:
-   OE, CE, OE + CE e Delta CE - OE.
+   OE, CE, OE + CE, Delta CE - OE e Razão CE/OE.
 """
 )
 
@@ -61,6 +62,19 @@ def make_unique_columns(columns):
             new_columns.append(f"{col}_{seen[col]}")
 
     return new_columns
+
+
+def safe_dataframe(df, n_rows=None):
+    df_show = df.copy()
+    df_show.columns = make_unique_columns(df_show.columns)
+
+    if n_rows is not None:
+        df_show = df_show.head(n_rows)
+
+    st.dataframe(
+        df_show.astype(str),
+        use_container_width=True
+    )
 
 
 def read_file(uploaded_file):
@@ -98,6 +112,25 @@ def sanitize_column_name(col):
     col = col.replace("]", "")
     col = col.replace("{", "")
     col = col.replace("}", "")
+    col = col.replace("ã", "a")
+    col = col.replace("á", "a")
+    col = col.replace("à", "a")
+    col = col.replace("â", "a")
+    col = col.replace("é", "e")
+    col = col.replace("ê", "e")
+    col = col.replace("í", "i")
+    col = col.replace("ó", "o")
+    col = col.replace("ô", "o")
+    col = col.replace("õ", "o")
+    col = col.replace("ú", "u")
+    col = col.replace("ç", "c")
+    col = col.replace("Ã", "A")
+    col = col.replace("Á", "A")
+    col = col.replace("É", "E")
+    col = col.replace("Í", "I")
+    col = col.replace("Ó", "O")
+    col = col.replace("Ú", "U")
+    col = col.replace("Ç", "C")
 
     if col == "":
         col = "coluna"
@@ -116,14 +149,25 @@ def find_default_column(columns, possible_names):
 
 
 def prepare_analysis_dataframe(raw_df, id_col, group_col, selected_vars):
-    df = raw_df[[id_col, group_col, "Condition"] + selected_vars].copy()
+    base_cols = [id_col, group_col, "Condition"]
+
+    all_cols = base_cols + selected_vars
+
+    unique_cols = []
+    for col in all_cols:
+        if col not in unique_cols:
+            unique_cols.append(col)
+
+    df = raw_df[unique_cols].copy()
+    df.columns = make_unique_columns(df.columns)
 
     df[id_col] = df[id_col].astype(str)
     df[group_col] = df[group_col].astype(str)
     df["Condition"] = df["Condition"].astype(str)
 
     for var in selected_vars:
-        df[var] = pd.to_numeric(df[var], errors="coerce")
+        if var in df.columns:
+            df[var] = pd.to_numeric(df[var], errors="coerce")
 
     df = df.dropna()
 
@@ -137,12 +181,17 @@ def create_safe_dataframe(df, id_col, group_col, selected_vars):
     rename_map[group_col] = "Group_safe"
     rename_map["Condition"] = "Condition_safe"
 
+    safe_vars = []
+
     for var in selected_vars:
-        rename_map[var] = sanitize_column_name(var)
+        safe_name = sanitize_column_name(var)
+        safe_vars.append(safe_name)
+        rename_map[var] = safe_name
 
     df_safe = df.rename(columns=rename_map)
+    df_safe.columns = make_unique_columns(df_safe.columns)
 
-    safe_vars = [rename_map[var] for var in selected_vars]
+    safe_vars = make_unique_columns(safe_vars)
 
     return df_safe, safe_vars
 
@@ -169,8 +218,6 @@ Ela indica se a mudança de OE para CE é diferente entre os grupos.
     )
 
     results = []
-    all_pvalues = []
-    pvalue_keys = []
 
     for var in safe_vars:
         formula = f"{var} ~ C(Group_safe) * C(Condition_safe)"
@@ -197,17 +244,12 @@ Ela indica se a mudança de OE para CE é diferente entre os grupos.
                 if term == "Intercept":
                     continue
 
-                pval = pvalues[term]
-
                 results.append({
                     "Variável": var,
                     "Termo": term,
                     "Coeficiente": params.get(term, np.nan),
-                    "p": pval
+                    "p": pvalues[term]
                 })
-
-                all_pvalues.append(pval)
-                pvalue_keys.append((var, term))
 
         except Exception as e:
             st.error(f"Erro ao ajustar o modelo misto para a variável {var}.")
@@ -231,7 +273,7 @@ Ela indica se a mudança de OE para CE é diferente entre os grupos.
             results_df["Significativo_FDR_0.05"] = False
 
         st.subheader("Resumo dos modelos mistos")
-        st.dataframe(results_df, use_container_width=True)
+        safe_dataframe(results_df)
 
         interaction_df = results_df[
             results_df["Termo"].str.contains(":", regex=False)
@@ -239,7 +281,7 @@ Ela indica se a mudança de OE para CE é diferente entre os grupos.
 
         if len(interaction_df) > 0:
             st.subheader("Resumo das interações Grupo × Condição")
-            st.dataframe(interaction_df, use_container_width=True)
+            safe_dataframe(interaction_df)
 
             st.write(
                 """
@@ -271,6 +313,8 @@ def make_wide_dataframe(df_safe, safe_vars):
     ]
 
     wide_df = wide_df.reset_index()
+    wide_df.columns = make_unique_columns(wide_df.columns)
+
     wide_df = wide_df.dropna()
 
     return wide_df
@@ -290,6 +334,7 @@ def create_delta_dataframe(wide_df, safe_vars):
             delta_features.append(delta_col)
 
     delta_df = delta_df.dropna()
+    delta_df.columns = make_unique_columns(delta_df.columns)
 
     return delta_df, delta_features
 
@@ -312,6 +357,7 @@ def create_ratio_dataframe(wide_df, safe_vars):
 
     ratio_df = ratio_df.replace([np.inf, -np.inf], np.nan)
     ratio_df = ratio_df.dropna()
+    ratio_df.columns = make_unique_columns(ratio_df.columns)
 
     return ratio_df, ratio_features
 
@@ -324,11 +370,14 @@ def run_lda_model(df, features, target_col, title):
     st.markdown("---")
     st.subheader(title)
 
+    features = [f for f in features if f in df.columns]
+
     if len(features) < 1:
         st.warning("Não há variáveis suficientes para este modelo.")
         return None
 
     model_df = df[[target_col] + features].copy()
+    model_df.columns = make_unique_columns(model_df.columns)
     model_df = model_df.dropna()
 
     X = model_df[features].astype(float).to_numpy()
@@ -337,9 +386,9 @@ def run_lda_model(df, features, target_col, title):
     group_counts = pd.Series(y).value_counts()
 
     st.write("Número de participantes por grupo:")
-    st.dataframe(group_counts.reset_index().rename(
-        columns={"index": "Grupo", 0: "n"}
-    ), use_container_width=True)
+    group_count_df = group_counts.reset_index()
+    group_count_df.columns = ["Grupo", "n"]
+    safe_dataframe(group_count_df)
 
     if len(group_counts) < 2:
         st.warning("A LDA precisa de pelo menos dois grupos.")
@@ -393,6 +442,7 @@ def run_lda_model(df, features, target_col, title):
         bal_acc = balanced_accuracy_score(y, y_pred_cv)
 
         labels = np.unique(y)
+
         cm = confusion_matrix(y, y_pred_cv, labels=labels)
 
         cm_df = pd.DataFrame(
@@ -407,7 +457,7 @@ def run_lda_model(df, features, target_col, title):
         st.write(f"**Balanced accuracy:** {bal_acc:.3f}")
 
         st.write("Matriz de confusão por validação cruzada:")
-        st.dataframe(cm_df, use_container_width=True)
+        safe_dataframe(cm_df)
 
         report = classification_report(
             y,
@@ -417,10 +467,10 @@ def run_lda_model(df, features, target_col, title):
         )
 
         report_df = pd.DataFrame(report).transpose()
-        st.write("Relatório de classificação:")
-        st.dataframe(report_df, use_container_width=True)
 
-        # Ajuste final apenas para extrair importância das variáveis
+        st.write("Relatório de classificação:")
+        safe_dataframe(report_df)
+
         pipeline.fit(X, y)
 
         fitted_lda = pipeline.named_steps["lda"]
@@ -442,7 +492,7 @@ def run_lda_model(df, features, target_col, title):
             )
 
             st.write("Variáveis com maior contribuição para a discriminação:")
-            st.dataframe(importance_df, use_container_width=True)
+            safe_dataframe(importance_df)
 
         result = {
             "Modelo": title,
@@ -468,13 +518,17 @@ def compare_classification_models(wide_df, safe_vars):
 
     results = []
 
-    # ----------------------------
-    # Modelo OE
-    # ----------------------------
     oe_features = [
         col for col in wide_df.columns
         if col.endswith("_OE")
     ]
+
+    ce_features = [
+        col for col in wide_df.columns
+        if col.endswith("_CE")
+    ]
+
+    both_features = oe_features + ce_features
 
     if len(oe_features) > 0:
         res_oe = run_lda_model(
@@ -487,14 +541,6 @@ def compare_classification_models(wide_df, safe_vars):
         if res_oe is not None:
             results.append(res_oe)
 
-    # ----------------------------
-    # Modelo CE
-    # ----------------------------
-    ce_features = [
-        col for col in wide_df.columns
-        if col.endswith("_CE")
-    ]
-
     if len(ce_features) > 0:
         res_ce = run_lda_model(
             df=wide_df,
@@ -505,11 +551,6 @@ def compare_classification_models(wide_df, safe_vars):
 
         if res_ce is not None:
             results.append(res_ce)
-
-    # ----------------------------
-    # Modelo OE + CE
-    # ----------------------------
-    both_features = oe_features + ce_features
 
     if len(both_features) > 0:
         res_both = run_lda_model(
@@ -522,9 +563,6 @@ def compare_classification_models(wide_df, safe_vars):
         if res_both is not None:
             results.append(res_both)
 
-    # ----------------------------
-    # Modelo Delta CE - OE
-    # ----------------------------
     delta_df, delta_features = create_delta_dataframe(wide_df, safe_vars)
 
     if len(delta_features) > 0:
@@ -538,9 +576,6 @@ def compare_classification_models(wide_df, safe_vars):
         if res_delta is not None:
             results.append(res_delta)
 
-    # ----------------------------
-    # Modelo Razão CE/OE
-    # ----------------------------
     ratio_df, ratio_features = create_ratio_dataframe(wide_df, safe_vars)
 
     if len(ratio_features) > 0:
@@ -554,9 +589,6 @@ def compare_classification_models(wide_df, safe_vars):
         if res_ratio is not None:
             results.append(res_ratio)
 
-    # ----------------------------
-    # Resumo
-    # ----------------------------
     if len(results) > 0:
         results_df = pd.DataFrame(results)
 
@@ -566,7 +598,7 @@ def compare_classification_models(wide_df, safe_vars):
         )
 
         st.subheader("Resumo comparativo dos modelos")
-        st.dataframe(results_df, use_container_width=True)
+        safe_dataframe(results_df)
 
         best_model = results_df.iloc[0]["Modelo"]
         best_bal_acc = results_df.iloc[0]["Balanced accuracy"]
@@ -576,7 +608,7 @@ def compare_classification_models(wide_df, safe_vars):
             f"({best_bal_acc:.3f})"
         )
 
-        fig, ax = plt.subplots(figsize=(9, 5))
+        fig, ax = plt.subplots(figsize=(10, 5))
 
         ax.bar(
             results_df["Modelo"],
@@ -643,7 +675,7 @@ raw_df.columns = make_unique_columns(raw_df.columns)
 st.header("2. Pré-visualização dos dados")
 
 st.write("Base combinada em formato longo:")
-st.dataframe(raw_df.head(30).astype(str), use_container_width=True)
+safe_dataframe(raw_df, n_rows=30)
 
 
 # ============================================================
@@ -685,10 +717,29 @@ with col_group:
         index=list(raw_df.columns).index(default_group)
     )
 
-numeric_cols = raw_df.select_dtypes(include="number").columns.tolist()
+if id_col == group_col:
+    st.error("A coluna de participante e a coluna de grupo não podem ser a mesma.")
+    st.stop()
+
+
+# ============================================================
+# Seleção das variáveis numéricas
+# ============================================================
+
+numeric_cols_all = raw_df.select_dtypes(include="number").columns.tolist()
+
+exclude_cols = [id_col, group_col, "Condition"]
+
+numeric_cols = [
+    col for col in numeric_cols_all
+    if col not in exclude_cols
+]
 
 if len(numeric_cols) < 1:
-    st.error("Não foram encontradas variáveis numéricas para análise.")
+    st.error(
+        "Não foram encontradas variáveis numéricas para análise depois de remover "
+        "as colunas de ID, grupo e condição."
+    )
     st.stop()
 
 selected_vars = st.multiselect(
@@ -701,6 +752,19 @@ if len(selected_vars) < 1:
     st.warning("Selecione pelo menos uma variável numérica.")
     st.stop()
 
+selected_vars = [
+    var for var in selected_vars
+    if var not in exclude_cols
+]
+
+if len(selected_vars) < 1:
+    st.warning("Depois de remover ID, grupo e condição, nenhuma variável postural permaneceu.")
+    st.stop()
+
+
+# ============================================================
+# Preparação da base
+# ============================================================
 
 analysis_df = prepare_analysis_dataframe(
     raw_df=raw_df,
@@ -714,25 +778,29 @@ if analysis_df.empty:
     st.stop()
 
 st.subheader("Base final em formato longo")
-st.dataframe(analysis_df.head(40).astype(str), use_container_width=True)
+safe_dataframe(analysis_df, n_rows=40)
 
 st.write("Número de observações por grupo e condição:")
+
 count_df = (
     analysis_df
     .groupby([group_col, "Condition"])
     .size()
     .reset_index(name="n")
 )
-st.dataframe(count_df, use_container_width=True)
+
+safe_dataframe(count_df)
 
 st.write("Número de participantes únicos por grupo:")
+
 participants_df = (
     analysis_df
     .groupby(group_col)[id_col]
     .nunique()
     .reset_index(name="n_participantes")
 )
-st.dataframe(participants_df, use_container_width=True)
+
+safe_dataframe(participants_df)
 
 
 df_safe, safe_vars = create_safe_dataframe(
@@ -743,11 +811,13 @@ df_safe, safe_vars = create_safe_dataframe(
 )
 
 st.subheader("Nomes seguros usados internamente")
+
 name_map_df = pd.DataFrame({
     "Nome original": selected_vars,
     "Nome usado no modelo": safe_vars
 })
-st.dataframe(name_map_df, use_container_width=True)
+
+safe_dataframe(name_map_df)
 
 
 # ============================================================
@@ -776,7 +846,7 @@ if n_incomplete > 0:
     )
 
     incomplete_df = repeat_check[repeat_check["n_condicoes"] < 2]
-    st.dataframe(incomplete_df, use_container_width=True)
+    safe_dataframe(incomplete_df)
 
 
 # ============================================================
@@ -826,9 +896,15 @@ Isso evita pseudorreplicação e permite comparar diretamente:
 wide_df = make_wide_dataframe(df_safe, safe_vars)
 
 st.subheader("Base em formato largo")
-st.dataframe(wide_df.head(30).astype(str), use_container_width=True)
+safe_dataframe(wide_df, n_rows=30)
 
 st.write(f"Número de participantes na base larga: **{len(wide_df)}**")
+
+if len(wide_df) < 4:
+    st.warning(
+        "A base larga tem poucos participantes. "
+        "A classificação pode não ser possível ou pode ser instável."
+    )
 
 if st.button("Rodar comparação dos modelos classificatórios"):
     compare_classification_models(wide_df, safe_vars)
@@ -848,7 +924,7 @@ O resultado mais importante é a interação:
 
 `Grupo × Condição`
 
-Se essa interação for significativa, isso sugere que a mudança de OE para CE
+Se essa interação for significativa, isso sugere que a diferença entre OE e CE
 não é igual nos grupos.
 
 Em termos fisiológicos, isso pode indicar que os pacientes com HIV apresentam
