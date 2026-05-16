@@ -3,19 +3,24 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-import statsmodels.formula.api as smf
-from statsmodels.stats.multitest import multipletests
-
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.metrics import (
-    confusion_matrix,
     accuracy_score,
     balanced_accuracy_score,
-    classification_report
+    f1_score,
+    recall_score,
+    confusion_matrix,
+    roc_auc_score
 )
+
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
 
 
 # ============================================================
@@ -23,22 +28,20 @@ from sklearn.metrics import (
 # ============================================================
 
 st.set_page_config(
-    page_title="Medidas Repetidas e LDA - Controle Postural",
+    page_title="Pipeline ML - HIV vs Controle",
     layout="wide"
 )
 
-st.title("Controle Postural - Medidas Repetidas e Classificação")
+st.title("Pipeline de Aprendizado de Máquina - Controle Postural")
 
 st.write(
     """
-Aplicativo para análise de dados de equilíbrio em duas condições visuais:
-**olhos abertos (OE)** e **olhos fechados (CE)**.
+Este aplicativo compara diferentes algoritmos de aprendizado de máquina para
+classificar participantes em grupos, usando variáveis posturais obtidas em
+condições de olhos abertos e olhos fechados.
 
-A análise foi organizada em duas partes:
-
-1. **Modelos mistos**, considerando que OE e CE são medidas repetidas do mesmo participante.
-2. **Modelos classificatórios**, comparando a capacidade de separar HIV e controles usando:
-   OE, CE, OE + CE, Delta CE - OE e Razão CE/OE.
+A normalização é feita **dentro da validação cruzada**, evitando vazamento de
+informação entre treino e teste.
 """
 )
 
@@ -71,13 +74,10 @@ def safe_dataframe(df, n_rows=None):
     if n_rows is not None:
         df_show = df_show.head(n_rows)
 
-    st.dataframe(
-        df_show.astype(str),
-        use_container_width=True
-    )
+    st.dataframe(df_show, use_container_width=True)
 
 
-def read_file(uploaded_file):
+def read_database(uploaded_file):
     if uploaded_file.name.endswith(".csv"):
         df = pd.read_csv(uploaded_file, sep=None, engine="python")
     elif uploaded_file.name.endswith((".xlsx", ".xls")):
@@ -90,866 +90,882 @@ def read_file(uploaded_file):
     return df
 
 
-def sanitize_column_name(col):
-    col = str(col)
-    col = col.replace("\ufeff", "")
-    col = col.strip()
-    col = col.replace(" ", "_")
-    col = col.replace("-", "_")
-    col = col.replace("/", "_")
-    col = col.replace("\\", "_")
-    col = col.replace("(", "")
-    col = col.replace(")", "")
-    col = col.replace(".", "_")
-    col = col.replace(",", "_")
-    col = col.replace("%", "perc")
-    col = col.replace(":", "_")
-    col = col.replace(";", "_")
-    col = col.replace("+", "_")
-    col = col.replace("*", "_")
-    col = col.replace("=", "_")
-    col = col.replace("[", "")
-    col = col.replace("]", "")
-    col = col.replace("{", "")
-    col = col.replace("}", "")
-    col = col.replace("ã", "a")
-    col = col.replace("á", "a")
-    col = col.replace("à", "a")
-    col = col.replace("â", "a")
-    col = col.replace("é", "e")
-    col = col.replace("ê", "e")
-    col = col.replace("í", "i")
-    col = col.replace("ó", "o")
-    col = col.replace("ô", "o")
-    col = col.replace("õ", "o")
-    col = col.replace("ú", "u")
-    col = col.replace("ç", "c")
-    col = col.replace("Ã", "A")
-    col = col.replace("Á", "A")
-    col = col.replace("É", "E")
-    col = col.replace("Í", "I")
-    col = col.replace("Ó", "O")
-    col = col.replace("Ú", "U")
-    col = col.replace("Ç", "C")
-
-    if col == "":
-        col = "coluna"
-
-    if col[0].isdigit():
-        col = "var_" + col
-
-    return col
+def sanitize_text(x):
+    return str(x).strip().lower()
 
 
-def find_default_column(columns, possible_names):
-    for name in possible_names:
-        if name in columns:
-            return name
+def normalize_condition_label(x):
+    x = sanitize_text(x)
+
+    if x in ["oe", "open", "open eyes", "olhos abertos", "abertos", "eye open", "eyes open"]:
+        return "OE"
+
+    if x in ["ce", "closed", "closed eyes", "olhos fechados", "fechados", "eye closed", "eyes closed"]:
+        return "CE"
+
+    return str(x).strip()
+
+
+def identify_default_column(columns, candidates):
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+
+    lower_map = {str(col).lower().strip(): col for col in columns}
+
+    for candidate in candidates:
+        candidate_lower = candidate.lower().strip()
+        if candidate_lower in lower_map:
+            return lower_map[candidate_lower]
+
     return columns[0]
 
 
-def prepare_analysis_dataframe(raw_df, id_col, group_col, selected_vars):
-    base_cols = [id_col, group_col, "Condition"]
+def create_wide_dataframe(df, id_col, group_col, condition_col, feature_cols):
+    work_df = df[[id_col, group_col, condition_col] + feature_cols].copy()
 
-    all_cols = base_cols + selected_vars
+    work_df[id_col] = work_df[id_col].astype(str)
+    work_df[group_col] = work_df[group_col].astype(str)
+    work_df[condition_col] = work_df[condition_col].apply(normalize_condition_label)
 
-    unique_cols = []
-    for col in all_cols:
-        if col not in unique_cols:
-            unique_cols.append(col)
+    for col in feature_cols:
+        work_df[col] = pd.to_numeric(work_df[col], errors="coerce")
 
-    df = raw_df[unique_cols].copy()
-    df.columns = make_unique_columns(df.columns)
+    work_df = work_df.dropna()
 
-    df[id_col] = df[id_col].astype(str)
-    df[group_col] = df[group_col].astype(str)
-    df["Condition"] = df["Condition"].astype(str)
-
-    for var in selected_vars:
-        if var in df.columns:
-            df[var] = pd.to_numeric(df[var], errors="coerce")
-
-    df = df.dropna()
-
-    return df
-
-
-def create_safe_dataframe(df, id_col, group_col, selected_vars):
-    rename_map = {}
-
-    rename_map[id_col] = "ID_safe"
-    rename_map[group_col] = "Group_safe"
-    rename_map["Condition"] = "Condition_safe"
-
-    safe_vars = []
-
-    for var in selected_vars:
-        safe_name = sanitize_column_name(var)
-        safe_vars.append(safe_name)
-        rename_map[var] = safe_name
-
-    df_safe = df.rename(columns=rename_map)
-    df_safe.columns = make_unique_columns(df_safe.columns)
-
-    safe_vars = make_unique_columns(safe_vars)
-
-    return df_safe, safe_vars
-
-
-# ============================================================
-# Modelo misto para medidas repetidas
-# ============================================================
-
-def run_mixed_models(df_safe, safe_vars):
-    st.subheader("Modelos mistos para medidas repetidas")
-
-    st.write(
-        """
-Cada variável postural será analisada separadamente usando o modelo:
-
-`Variável ~ Grupo * Condição + (1 | Participante)`
-
-O termo mais importante para sua pergunta é a interação:
-
-`Grupo × Condição`
-
-Ela indica se a mudança de OE para CE é diferente entre os grupos.
-"""
-    )
-
-    results = []
-
-    for var in safe_vars:
-        formula = f"{var} ~ C(Group_safe) * C(Condition_safe)"
-
-        st.markdown("---")
-        st.write(f"### Variável: `{var}`")
-        st.code(formula)
-
-        try:
-            model = smf.mixedlm(
-                formula=formula,
-                data=df_safe,
-                groups=df_safe["ID_safe"]
-            )
-
-            fit = model.fit(reml=False, method="lbfgs")
-
-            st.text(fit.summary())
-
-            params = fit.params
-            pvalues = fit.pvalues
-
-            for term in pvalues.index:
-                if term == "Intercept":
-                    continue
-
-                results.append({
-                    "Variável": var,
-                    "Termo": term,
-                    "Coeficiente": params.get(term, np.nan),
-                    "p": pvalues[term]
-                })
-
-        except Exception as e:
-            st.error(f"Erro ao ajustar o modelo misto para a variável {var}.")
-            st.exception(e)
-
-    if len(results) > 0:
-        results_df = pd.DataFrame(results)
-
-        try:
-            reject, p_fdr, _, _ = multipletests(
-                results_df["p"].values,
-                alpha=0.05,
-                method="fdr_bh"
-            )
-
-            results_df["p_FDR"] = p_fdr
-            results_df["Significativo_FDR_0.05"] = reject
-
-        except Exception:
-            results_df["p_FDR"] = np.nan
-            results_df["Significativo_FDR_0.05"] = False
-
-        st.subheader("Resumo dos modelos mistos")
-        safe_dataframe(results_df)
-
-        interaction_df = results_df[
-            results_df["Termo"].str.contains(":", regex=False)
-        ].copy()
-
-        if len(interaction_df) > 0:
-            st.subheader("Resumo das interações Grupo × Condição")
-            safe_dataframe(interaction_df)
-
-            st.write(
-                """
-A presença de interações significativas sugere que a diferença entre OE e CE
-não é igual nos grupos. Esse é o resultado mais relevante para investigar se
-os pacientes com HIV dependem diferentemente da visão para o controle postural.
-"""
-            )
-
-
-# ============================================================
-# Transformação para formato largo
-# ============================================================
-
-def make_wide_dataframe(df_safe, safe_vars):
-    wide_df = df_safe[
-        ["ID_safe", "Group_safe", "Condition_safe"] + safe_vars
-    ].copy()
-
-    wide_df = wide_df.pivot_table(
-        index=["ID_safe", "Group_safe"],
-        columns="Condition_safe",
-        values=safe_vars,
+    wide_df = work_df.pivot_table(
+        index=[id_col, group_col],
+        columns=condition_col,
+        values=feature_cols,
         aggfunc="mean"
     )
 
     wide_df.columns = [
-        f"{var}_{cond}" for var, cond in wide_df.columns
+        f"{feature}__{condition}" for feature, condition in wide_df.columns
     ]
 
     wide_df = wide_df.reset_index()
     wide_df.columns = make_unique_columns(wide_df.columns)
 
-    wide_df = wide_df.dropna()
-
     return wide_df
 
 
-def create_delta_dataframe(wide_df, safe_vars):
-    delta_df = wide_df[["ID_safe", "Group_safe"]].copy()
+def build_feature_sets(wide_df, original_features):
+    feature_sets = {}
+
+    oe_features = []
+    ce_features = []
+
+    for feature in original_features:
+        oe_col = f"{feature}__OE"
+        ce_col = f"{feature}__CE"
+
+        if oe_col in wide_df.columns:
+            oe_features.append(oe_col)
+
+        if ce_col in wide_df.columns:
+            ce_features.append(ce_col)
+
+    if len(oe_features) > 0:
+        feature_sets["OE"] = oe_features
+
+    if len(ce_features) > 0:
+        feature_sets["CE"] = ce_features
+
+    if len(oe_features) > 0 and len(ce_features) > 0:
+        feature_sets["OE + CE"] = oe_features + ce_features
+
+    # Delta CE - OE
+    delta_df = wide_df.copy()
     delta_features = []
 
-    for var in safe_vars:
-        col_oe = f"{var}_OE"
-        col_ce = f"{var}_CE"
+    for feature in original_features:
+        oe_col = f"{feature}__OE"
+        ce_col = f"{feature}__CE"
 
-        if col_oe in wide_df.columns and col_ce in wide_df.columns:
-            delta_col = f"Delta_{var}_CE_menos_OE"
-            delta_df[delta_col] = wide_df[col_ce] - wide_df[col_oe]
+        if oe_col in wide_df.columns and ce_col in wide_df.columns:
+            delta_col = f"Delta__{feature}"
+            delta_df[delta_col] = wide_df[ce_col] - wide_df[oe_col]
             delta_features.append(delta_col)
 
-    delta_df = delta_df.dropna()
-    delta_df.columns = make_unique_columns(delta_df.columns)
+    if len(delta_features) > 0:
+        feature_sets["Delta CE - OE"] = delta_features
 
-    return delta_df, delta_features
-
-
-def create_ratio_dataframe(wide_df, safe_vars):
-    ratio_df = wide_df[["ID_safe", "Group_safe"]].copy()
+    # Razão CE/OE
+    ratio_df = delta_df.copy()
     ratio_features = []
 
-    for var in safe_vars:
-        col_oe = f"{var}_OE"
-        col_ce = f"{var}_CE"
+    for feature in original_features:
+        oe_col = f"{feature}__OE"
+        ce_col = f"{feature}__CE"
 
-        if col_oe in wide_df.columns and col_ce in wide_df.columns:
-            ratio_col = f"Ratio_{var}_CE_div_OE"
-
-            oe_values = wide_df[col_oe].replace(0, np.nan)
-            ratio_df[ratio_col] = wide_df[col_ce] / oe_values
-
+        if oe_col in wide_df.columns and ce_col in wide_df.columns:
+            ratio_col = f"Ratio__{feature}"
+            denominator = wide_df[oe_col].replace(0, np.nan)
+            ratio_df[ratio_col] = wide_df[ce_col] / denominator
             ratio_features.append(ratio_col)
 
     ratio_df = ratio_df.replace([np.inf, -np.inf], np.nan)
-    ratio_df = ratio_df.dropna()
-    ratio_df.columns = make_unique_columns(ratio_df.columns)
-
-    return ratio_df, ratio_features
-
-
-# ============================================================
-# LDA com validação cruzada
-# ============================================================
-
-def run_lda_model(df, features, target_col, title):
-    st.markdown("---")
-    st.subheader(title)
-
-    features = [f for f in features if f in df.columns]
-
-    if len(features) < 1:
-        st.warning("Não há variáveis suficientes para este modelo.")
-        return None
-
-    model_df = df[[target_col] + features].copy()
-    model_df.columns = make_unique_columns(model_df.columns)
-    model_df = model_df.dropna()
-
-    X = model_df[features].astype(float).to_numpy()
-    y = model_df[target_col].astype(str).to_numpy()
-
-    group_counts = pd.Series(y).value_counts()
-
-    st.write("Número de participantes por grupo:")
-    group_count_df = group_counts.reset_index()
-    group_count_df.columns = ["Grupo", "n"]
-    safe_dataframe(group_count_df)
-
-    if len(group_counts) < 2:
-        st.warning("A LDA precisa de pelo menos dois grupos.")
-        return None
-
-    min_n = group_counts.min()
-
-    if min_n < 2:
-        st.warning("Não há participantes suficientes por grupo para validação cruzada.")
-        return None
-
-    cv_n = min(10, min_n)
-
-    if len(model_df) <= cv_n:
-        st.warning("Número de participantes muito pequeno para esta validação cruzada.")
-        return None
-
-    lda = LinearDiscriminantAnalysis(
-        solver="lsqr",
-        shrinkage="auto"
-    )
-
-    pipeline = Pipeline([
-        ("scaler", StandardScaler()),
-        ("lda", lda)
-    ])
-
-    cv = StratifiedKFold(
-        n_splits=cv_n,
-        shuffle=True,
-        random_state=42
-    )
-
-    try:
-        scores = cross_val_score(
-            pipeline,
-            X,
-            y,
-            cv=cv,
-            scoring="accuracy"
-        )
-
-        y_pred_cv = cross_val_predict(
-            pipeline,
-            X,
-            y,
-            cv=cv
-        )
-
-        acc = accuracy_score(y, y_pred_cv)
-        bal_acc = balanced_accuracy_score(y, y_pred_cv)
-
-        labels = np.unique(y)
-
-        cm = confusion_matrix(y, y_pred_cv, labels=labels)
-
-        cm_df = pd.DataFrame(
-            cm,
-            index=[f"Real {label}" for label in labels],
-            columns=[f"Predito {label}" for label in labels]
-        )
-
-        st.write(f"**Acurácia média ({cv_n}-fold CV):** {scores.mean():.3f}")
-        st.write(f"**Desvio-padrão da acurácia:** {scores.std():.3f}")
-        st.write(f"**Acurácia por predição cruzada:** {acc:.3f}")
-        st.write(f"**Balanced accuracy:** {bal_acc:.3f}")
-
-        st.write("Matriz de confusão por validação cruzada:")
-        safe_dataframe(cm_df)
-
-        report = classification_report(
-            y,
-            y_pred_cv,
-            output_dict=True,
-            zero_division=0
-        )
-
-        report_df = pd.DataFrame(report).transpose()
-
-        st.write("Relatório de classificação:")
-        safe_dataframe(report_df)
-
-        pipeline.fit(X, y)
-
-        fitted_lda = pipeline.named_steps["lda"]
-
-        if hasattr(fitted_lda, "coef_"):
-            coef = fitted_lda.coef_
-
-            if coef.ndim == 2:
-                importance = np.mean(np.abs(coef), axis=0)
-            else:
-                importance = np.abs(coef)
-
-            importance_df = pd.DataFrame({
-                "Variável": features,
-                "Importância média absoluta": importance
-            }).sort_values(
-                by="Importância média absoluta",
-                ascending=False
-            )
-
-            st.write("Variáveis com maior contribuição para a discriminação:")
-            safe_dataframe(importance_df)
-
-        result = {
-            "Modelo": title,
-            "N participantes": len(model_df),
-            "N variáveis": len(features),
-            "CV folds": cv_n,
-            "Acurácia média": scores.mean(),
-            "DP acurácia": scores.std(),
-            "Acurácia CV": acc,
-            "Balanced accuracy": bal_acc
-        }
-
-        return result
-
-    except Exception as e:
-        st.error(f"Erro ao rodar a LDA para o modelo: {title}")
-        st.exception(e)
-        return None
-
-
-def compare_classification_models(wide_df, safe_vars):
-    st.subheader("Comparação dos modelos classificatórios")
-
-    results = []
-
-    oe_features = [
-        col for col in wide_df.columns
-        if col.endswith("_OE")
-    ]
-
-    ce_features = [
-        col for col in wide_df.columns
-        if col.endswith("_CE")
-    ]
-
-    both_features = oe_features + ce_features
-
-    if len(oe_features) > 0:
-        res_oe = run_lda_model(
-            df=wide_df,
-            features=oe_features,
-            target_col="Group_safe",
-            title="Modelo OE - apenas olhos abertos"
-        )
-
-        if res_oe is not None:
-            results.append(res_oe)
-
-    if len(ce_features) > 0:
-        res_ce = run_lda_model(
-            df=wide_df,
-            features=ce_features,
-            target_col="Group_safe",
-            title="Modelo CE - apenas olhos fechados"
-        )
-
-        if res_ce is not None:
-            results.append(res_ce)
-
-    if len(both_features) > 0:
-        res_both = run_lda_model(
-            df=wide_df,
-            features=both_features,
-            target_col="Group_safe",
-            title="Modelo OE + CE - condições combinadas"
-        )
-
-        if res_both is not None:
-            results.append(res_both)
-
-    delta_df, delta_features = create_delta_dataframe(wide_df, safe_vars)
-
-    if len(delta_features) > 0:
-        res_delta = run_lda_model(
-            df=delta_df,
-            features=delta_features,
-            target_col="Group_safe",
-            title="Modelo Delta - CE menos OE"
-        )
-
-        if res_delta is not None:
-            results.append(res_delta)
-
-    ratio_df, ratio_features = create_ratio_dataframe(wide_df, safe_vars)
 
     if len(ratio_features) > 0:
-        res_ratio = run_lda_model(
-            df=ratio_df,
-            features=ratio_features,
-            target_col="Group_safe",
-            title="Modelo Razão - CE dividido por OE"
-        )
+        feature_sets["Razão CE/OE"] = ratio_features
 
-        if res_ratio is not None:
-            results.append(res_ratio)
+    # OE + CE + Delta
+    if len(oe_features) > 0 and len(ce_features) > 0 and len(delta_features) > 0:
+        feature_sets["OE + CE + Delta"] = oe_features + ce_features + delta_features
 
-    if len(results) > 0:
-        results_df = pd.DataFrame(results)
+    final_df = ratio_df.copy()
 
-        results_df = results_df.sort_values(
-            by="Balanced accuracy",
-            ascending=False
-        )
+    return final_df, feature_sets
 
-        st.subheader("Resumo comparativo dos modelos")
-        safe_dataframe(results_df)
 
-        best_model = results_df.iloc[0]["Modelo"]
-        best_bal_acc = results_df.iloc[0]["Balanced accuracy"]
+def get_algorithms(random_state=42):
+    algorithms = {
+        "LDA": LinearDiscriminantAnalysis(
+            solver="lsqr",
+            shrinkage="auto"
+        ),
 
-        st.success(
-            f"Melhor modelo pela balanced accuracy: {best_model} "
-            f"({best_bal_acc:.3f})"
-        )
+        "Regressão logística": LogisticRegression(
+            max_iter=5000,
+            class_weight="balanced",
+            solver="liblinear",
+            random_state=random_state
+        ),
 
-        fig, ax = plt.subplots(figsize=(10, 5))
+        "SVM linear": SVC(
+            kernel="linear",
+            probability=True,
+            class_weight="balanced",
+            random_state=random_state
+        ),
 
-        ax.bar(
-            results_df["Modelo"],
-            results_df["Balanced accuracy"]
-        )
+        "SVM RBF": SVC(
+            kernel="rbf",
+            probability=True,
+            class_weight="balanced",
+            random_state=random_state
+        ),
 
-        ax.set_ylabel("Balanced accuracy")
-        ax.set_xlabel("Modelo")
-        ax.set_title("Comparação dos modelos classificatórios")
-        ax.set_ylim(0, 1)
-        ax.tick_params(axis="x", rotation=45)
-        ax.grid(axis="y", alpha=0.3)
+        "Random Forest": RandomForestClassifier(
+            n_estimators=500,
+            class_weight="balanced",
+            random_state=random_state
+        ),
 
-        st.pyplot(fig)
+        "Gradient Boosting": GradientBoostingClassifier(
+            random_state=random_state
+        ),
 
+        "KNN": KNeighborsClassifier(
+            n_neighbors=5
+        ),
+
+        "Naive Bayes": GaussianNB()
+    }
+
+    return algorithms
+
+
+def compute_binary_metrics(y_true, y_pred, y_score, positive_label):
+    labels = np.unique(y_true)
+
+    acc = accuracy_score(y_true, y_pred)
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, pos_label=positive_label, zero_division=0)
+    sensitivity = recall_score(y_true, y_pred, pos_label=positive_label, zero_division=0)
+
+    negative_labels = [label for label in labels if label != positive_label]
+
+    if len(negative_labels) == 1:
+        negative_label = negative_labels[0]
+        specificity = recall_score(y_true, y_pred, pos_label=negative_label, zero_division=0)
     else:
-        st.warning("Nenhum modelo classificatório pôde ser ajustado.")
+        specificity = np.nan
+
+    auc = np.nan
+
+    if y_score is not None and len(labels) == 2:
+        y_true_binary = np.array([1 if y == positive_label else 0 for y in y_true])
+
+        try:
+            auc = roc_auc_score(y_true_binary, y_score)
+        except Exception:
+            auc = np.nan
+
+    return {
+        "accuracy": acc,
+        "balanced_accuracy": bal_acc,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "f1": f1,
+        "auc": auc
+    }
+
+
+def bootstrap_ci(values, n_bootstrap=1000, ci=95, random_state=42):
+    values = np.array(values)
+    values = values[~np.isnan(values)]
+
+    if len(values) == 0:
+        return np.nan, np.nan
+
+    rng = np.random.default_rng(random_state)
+    boot_means = []
+
+    for _ in range(n_bootstrap):
+        sample = rng.choice(values, size=len(values), replace=True)
+        boot_means.append(np.mean(sample))
+
+    alpha = (100 - ci) / 2
+
+    lower = np.percentile(boot_means, alpha)
+    upper = np.percentile(boot_means, 100 - alpha)
+
+    return lower, upper
+
+
+def evaluate_model_repeated_cv(
+    X,
+    y,
+    model,
+    positive_label,
+    n_splits=5,
+    n_repeats=50,
+    n_bootstrap=1000,
+    random_state=42
+):
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", model)
+    ])
+
+    cv = RepeatedStratifiedKFold(
+        n_splits=n_splits,
+        n_repeats=n_repeats,
+        random_state=random_state
+    )
+
+    fold_metrics = []
+
+    all_y_true = []
+    all_y_pred = []
+    all_y_score = []
+
+    for train_idx, test_idx in cv.split(X, y):
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+
+        pipeline.fit(X_train, y_train)
+
+        y_pred = pipeline.predict(X_test)
+
+        y_score = None
+
+        if hasattr(pipeline.named_steps["model"], "predict_proba"):
+            try:
+                proba = pipeline.predict_proba(X_test)
+                classes = pipeline.named_steps["model"].classes_
+
+                if positive_label in classes:
+                    pos_index = list(classes).index(positive_label)
+                    y_score = proba[:, pos_index]
+            except Exception:
+                y_score = None
+
+        elif hasattr(pipeline.named_steps["model"], "decision_function"):
+            try:
+                score = pipeline.decision_function(X_test)
+                y_score = score
+            except Exception:
+                y_score = None
+
+        metrics = compute_binary_metrics(
+            y_true=y_test,
+            y_pred=y_pred,
+            y_score=y_score,
+            positive_label=positive_label
+        )
+
+        fold_metrics.append(metrics)
+
+        all_y_true.extend(y_test)
+        all_y_pred.extend(y_pred)
+
+        if y_score is not None:
+            all_y_score.extend(y_score)
+        else:
+            all_y_score.extend([np.nan] * len(y_test))
+
+    metrics_df = pd.DataFrame(fold_metrics)
+
+    summary = {}
+
+    for metric in ["accuracy", "balanced_accuracy", "sensitivity", "specificity", "f1", "auc"]:
+        values = metrics_df[metric].values
+
+        mean_value = np.nanmean(values)
+        sd_value = np.nanstd(values)
+
+        ci_low, ci_high = bootstrap_ci(
+            values,
+            n_bootstrap=n_bootstrap,
+            ci=95,
+            random_state=random_state
+        )
+
+        summary[f"{metric}_mean"] = mean_value
+        summary[f"{metric}_sd"] = sd_value
+        summary[f"{metric}_ci95_low"] = ci_low
+        summary[f"{metric}_ci95_high"] = ci_high
+
+    all_y_true = np.array(all_y_true)
+    all_y_pred = np.array(all_y_pred)
+
+    labels = np.unique(y)
+
+    cm = confusion_matrix(
+        all_y_true,
+        all_y_pred,
+        labels=labels
+    )
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=[f"Real {label}" for label in labels],
+        columns=[f"Predito {label}" for label in labels]
+    )
+
+    return summary, metrics_df, cm_df
+
+
+def fit_final_model_and_importance(X, y, feature_names, model):
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", model)
+    ])
+
+    pipeline.fit(X, y)
+
+    fitted_model = pipeline.named_steps["model"]
+
+    importance_df = None
+
+    if hasattr(fitted_model, "coef_"):
+        coef = fitted_model.coef_
+
+        if coef.ndim == 2:
+            importance = np.mean(np.abs(coef), axis=0)
+        else:
+            importance = np.abs(coef)
+
+        importance_df = pd.DataFrame({
+            "Variável": feature_names,
+            "Importância": importance
+        }).sort_values("Importância", ascending=False)
+
+    elif hasattr(fitted_model, "feature_importances_"):
+        importance = fitted_model.feature_importances_
+
+        importance_df = pd.DataFrame({
+            "Variável": feature_names,
+            "Importância": importance
+        }).sort_values("Importância", ascending=False)
+
+    return pipeline, importance_df
 
 
 # ============================================================
-# Upload dos arquivos
+# Upload da base
 # ============================================================
 
-st.header("1. Upload dos arquivos")
+st.header("1. Carregar base de dados")
 
-col1, col2 = st.columns(2)
+uploaded_file = st.file_uploader(
+    "Envie sua base de dados em CSV, XLSX ou XLS",
+    type=["csv", "xlsx", "xls"]
+)
+
+if uploaded_file is None:
+    st.info("Envie a base de dados para iniciar.")
+    st.stop()
+
+df = read_database(uploaded_file)
+
+if df is None:
+    st.stop()
+
+st.subheader("Pré-visualização da base")
+safe_dataframe(df, n_rows=20)
+
+st.write(f"Número de linhas: **{df.shape[0]}**")
+st.write(f"Número de colunas: **{df.shape[1]}**")
+
+
+# ============================================================
+# Configuração das colunas
+# ============================================================
+
+st.header("2. Configuração das colunas")
+
+columns = df.columns.tolist()
+
+default_group = identify_default_column(
+    columns,
+    ["Groups", "Group", "Grupo", "grupo", "Classe", "class"]
+)
+
+default_condition = identify_default_column(
+    columns,
+    ["Condition", "condition", "Condição", "Condicao", "condição", "condicao"]
+)
+
+default_id = identify_default_column(
+    columns,
+    ["Participant", "Participante", "ID", "Id", "id", "Subject", "Sujeito"]
+)
+
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    file_oe = st.file_uploader(
-        "Arquivo de olhos abertos - OE",
-        type=["csv", "xlsx", "xls"],
-        key="file_oe"
+    id_col = st.selectbox(
+        "Coluna do participante",
+        columns,
+        index=columns.index(default_id)
     )
 
 with col2:
-    file_ce = st.file_uploader(
-        "Arquivo de olhos fechados - CE",
-        type=["csv", "xlsx", "xls"],
-        key="file_ce"
-    )
-
-if file_oe is None or file_ce is None:
-    st.info("Envie os dois arquivos para iniciar a análise.")
-    st.stop()
-
-
-df_oe = read_file(file_oe)
-df_ce = read_file(file_ce)
-
-if df_oe is None or df_ce is None:
-    st.stop()
-
-df_oe["Condition"] = "OE"
-df_ce["Condition"] = "CE"
-
-raw_df = pd.concat([df_oe, df_ce], ignore_index=True)
-raw_df.columns = make_unique_columns(raw_df.columns)
-
-
-# ============================================================
-# Visualização inicial
-# ============================================================
-
-st.header("2. Pré-visualização dos dados")
-
-st.write("Base combinada em formato longo:")
-safe_dataframe(raw_df, n_rows=30)
-
-
-# ============================================================
-# Configuração da análise
-# ============================================================
-
-st.header("3. Configuração da análise")
-
-possible_id_cols = [
-    "ID", "Id", "id",
-    "Participante", "participante",
-    "Subject", "subject",
-    "Sujeito", "sujeito",
-    "Codigo", "Código", "codigo", "código"
-]
-
-possible_group_cols = [
-    "Groups", "Group", "Grupo", "grupo",
-    "GROUP", "groups",
-    "Classe", "classe"
-]
-
-default_id = find_default_column(raw_df.columns, possible_id_cols)
-default_group = find_default_column(raw_df.columns, possible_group_cols)
-
-col_id, col_group = st.columns(2)
-
-with col_id:
-    id_col = st.selectbox(
-        "Selecione a coluna que identifica o participante",
-        raw_df.columns,
-        index=list(raw_df.columns).index(default_id)
-    )
-
-with col_group:
     group_col = st.selectbox(
-        "Selecione a coluna que identifica os grupos",
-        raw_df.columns,
-        index=list(raw_df.columns).index(default_group)
+        "Coluna do grupo",
+        columns,
+        index=columns.index(default_group)
     )
 
-if id_col == group_col:
-    st.error("A coluna de participante e a coluna de grupo não podem ser a mesma.")
+with col3:
+    condition_col = st.selectbox(
+        "Coluna da condição visual",
+        columns,
+        index=columns.index(default_condition)
+    )
+
+if len(set([id_col, group_col, condition_col])) < 3:
+    st.error("As colunas de participante, grupo e condição devem ser diferentes.")
     st.stop()
 
 
 # ============================================================
-# Seleção das variáveis numéricas
+# Seleção das variáveis
 # ============================================================
 
-numeric_cols_all = raw_df.select_dtypes(include="number").columns.tolist()
+st.header("3. Seleção das variáveis posturais")
 
-exclude_cols = [id_col, group_col, "Condition"]
+numeric_cols = df.select_dtypes(include="number").columns.tolist()
 
-numeric_cols = [
-    col for col in numeric_cols_all
+exclude_cols = [id_col, group_col, condition_col]
+
+available_features = [
+    col for col in numeric_cols
     if col not in exclude_cols
 ]
 
-if len(numeric_cols) < 1:
-    st.error(
-        "Não foram encontradas variáveis numéricas para análise depois de remover "
-        "as colunas de ID, grupo e condição."
-    )
+if len(available_features) == 0:
+    st.error("Nenhuma variável numérica disponível para análise.")
     st.stop()
 
-selected_vars = st.multiselect(
+selected_features = st.multiselect(
     "Selecione as variáveis posturais",
-    numeric_cols,
-    default=numeric_cols
+    available_features,
+    default=available_features
 )
 
-if len(selected_vars) < 1:
-    st.warning("Selecione pelo menos uma variável numérica.")
+if len(selected_features) == 0:
+    st.warning("Selecione pelo menos uma variável.")
     st.stop()
 
-selected_vars = [
-    var for var in selected_vars
-    if var not in exclude_cols
-]
-
-if len(selected_vars) < 1:
-    st.warning("Depois de remover ID, grupo e condição, nenhuma variável postural permaneceu.")
-    st.stop()
+st.write("Variáveis selecionadas:")
+st.write(selected_features)
 
 
 # ============================================================
-# Preparação da base
+# Configuração da validação
 # ============================================================
 
-analysis_df = prepare_analysis_dataframe(
-    raw_df=raw_df,
-    id_col=id_col,
-    group_col=group_col,
-    selected_vars=selected_vars
-)
+st.header("4. Configuração da validação")
 
-if analysis_df.empty:
-    st.error("A base final ficou vazia após remover valores ausentes.")
-    st.stop()
+col_cv1, col_cv2, col_cv3 = st.columns(3)
 
-st.subheader("Base final em formato longo")
-safe_dataframe(analysis_df, n_rows=40)
-
-st.write("Número de observações por grupo e condição:")
-
-count_df = (
-    analysis_df
-    .groupby([group_col, "Condition"])
-    .size()
-    .reset_index(name="n")
-)
-
-safe_dataframe(count_df)
-
-st.write("Número de participantes únicos por grupo:")
-
-participants_df = (
-    analysis_df
-    .groupby(group_col)[id_col]
-    .nunique()
-    .reset_index(name="n_participantes")
-)
-
-safe_dataframe(participants_df)
-
-
-df_safe, safe_vars = create_safe_dataframe(
-    df=analysis_df,
-    id_col=id_col,
-    group_col=group_col,
-    selected_vars=selected_vars
-)
-
-st.subheader("Nomes seguros usados internamente")
-
-name_map_df = pd.DataFrame({
-    "Nome original": selected_vars,
-    "Nome usado no modelo": safe_vars
-})
-
-safe_dataframe(name_map_df)
-
-
-# ============================================================
-# Checagem de medidas repetidas
-# ============================================================
-
-st.header("4. Checagem das medidas repetidas")
-
-repeat_check = (
-    analysis_df
-    .groupby([id_col, group_col])["Condition"]
-    .nunique()
-    .reset_index(name="n_condicoes")
-)
-
-n_complete = (repeat_check["n_condicoes"] == 2).sum()
-n_incomplete = (repeat_check["n_condicoes"] < 2).sum()
-
-st.write(f"Participantes com OE e CE completos: **{n_complete}**")
-st.write(f"Participantes incompletos: **{n_incomplete}**")
-
-if n_incomplete > 0:
-    st.warning(
-        "Há participantes sem uma das condições visuais. "
-        "Eles poderão ser excluídos das análises em formato largo."
+with col_cv1:
+    n_splits = st.number_input(
+        "Número de folds",
+        min_value=2,
+        max_value=10,
+        value=5,
+        step=1
     )
 
-    incomplete_df = repeat_check[repeat_check["n_condicoes"] < 2]
-    safe_dataframe(incomplete_df)
+with col_cv2:
+    n_repeats = st.number_input(
+        "Número de repetições",
+        min_value=1,
+        max_value=200,
+        value=50,
+        step=1
+    )
 
+with col_cv3:
+    n_bootstrap = st.number_input(
+        "Número de reamostragens bootstrap",
+        min_value=100,
+        max_value=5000,
+        value=1000,
+        step=100
+    )
 
-# ============================================================
-# Modelos mistos
-# ============================================================
-
-st.header("5. Inferência estatística com modelos mistos")
-
-st.write(
-    """
-Esta etapa considera explicitamente que OE e CE são medidas repetidas do
-mesmo participante.
-
-Ela responde principalmente:
-
-- existe diferença entre grupos?
-- existe diferença entre OE e CE?
-- a mudança entre OE e CE é diferente entre HIV e controles?
-"""
+random_state = st.number_input(
+    "Random state",
+    min_value=0,
+    max_value=9999,
+    value=42,
+    step=1
 )
 
-if st.button("Rodar modelos mistos"):
-    run_mixed_models(df_safe, safe_vars)
-
 
 # ============================================================
-# Classificação
+# Preparação dos dados
 # ============================================================
 
-st.header("6. Classificação HIV vs controle")
+st.header("5. Preparação dos dados")
 
-st.write(
-    """
-Nesta etapa, os dados são transformados para formato largo, com uma única
-linha por participante.
+df_work = df.copy()
+df_work[condition_col] = df_work[condition_col].apply(normalize_condition_label)
 
-Isso evita pseudorreplicação e permite comparar diretamente:
+st.write("Condições visuais identificadas:")
+condition_counts = df_work[condition_col].value_counts().reset_index()
+condition_counts.columns = ["Condição", "n"]
+safe_dataframe(condition_counts)
 
-1. Modelo OE
-2. Modelo CE
-3. Modelo OE + CE
-4. Modelo Delta CE - OE
-5. Modelo Razão CE/OE
-"""
+st.write("Grupos identificados:")
+group_counts = df_work[group_col].value_counts().reset_index()
+group_counts.columns = ["Grupo", "n"]
+safe_dataframe(group_counts)
+
+if df_work[group_col].nunique() != 2:
+    st.error(
+        "Este pipeline foi construído para classificação binária. "
+        "A coluna de grupo precisa ter exatamente dois grupos."
+    )
+    st.stop()
+
+groups = sorted(df_work[group_col].astype(str).unique().tolist())
+
+positive_label = st.selectbox(
+    "Escolha o grupo considerado positivo para sensibilidade/AUC",
+    groups,
+    index=0
 )
 
-wide_df = make_wide_dataframe(df_safe, safe_vars)
+wide_df = create_wide_dataframe(
+    df=df_work,
+    id_col=id_col,
+    group_col=group_col,
+    condition_col=condition_col,
+    feature_cols=selected_features
+)
 
 st.subheader("Base em formato largo")
-safe_dataframe(wide_df, n_rows=30)
+safe_dataframe(wide_df, n_rows=20)
 
-st.write(f"Número de participantes na base larga: **{len(wide_df)}**")
+st.write(f"Número de participantes na base larga: **{wide_df.shape[0]}**")
 
-if len(wide_df) < 4:
-    st.warning(
-        "A base larga tem poucos participantes. "
-        "A classificação pode não ser possível ou pode ser instável."
+wide_complete_df, feature_sets = build_feature_sets(
+    wide_df=wide_df,
+    original_features=selected_features
+)
+
+st.subheader("Conjuntos de variáveis criados")
+
+feature_set_summary = pd.DataFrame({
+    "Conjunto": list(feature_sets.keys()),
+    "Número de variáveis": [len(v) for v in feature_sets.values()]
+})
+
+safe_dataframe(feature_set_summary)
+
+if len(feature_sets) == 0:
+    st.error("Nenhum conjunto de variáveis pôde ser criado.")
+    st.stop()
+
+
+# ============================================================
+# Rodar análise
+# ============================================================
+
+st.header("6. Rodar comparação dos algoritmos")
+
+st.write(
+    """
+Para cada conjunto de variáveis, todos os algoritmos serão avaliados usando:
+
+- normalização dentro do pipeline;
+- validação cruzada estratificada repetida;
+- intervalo de confiança bootstrap das métricas.
+"""
+)
+
+run_analysis = st.button("Rodar pipeline completo")
+
+if run_analysis:
+
+    algorithms = get_algorithms(random_state=int(random_state))
+
+    all_results = []
+    detailed_metrics = {}
+    confusion_matrices = {}
+    importances = {}
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    total_runs = len(feature_sets) * len(algorithms)
+    current_run = 0
+
+    for feature_set_name, features in feature_sets.items():
+
+        model_df = wide_complete_df[[group_col] + features].copy()
+        model_df = model_df.replace([np.inf, -np.inf], np.nan)
+        model_df = model_df.dropna()
+
+        if model_df.shape[0] < 4:
+            st.warning(f"Conjunto {feature_set_name}: poucos participantes após remoção de ausentes.")
+            continue
+
+        X = model_df[features].astype(float).to_numpy()
+        y = model_df[group_col].astype(str).to_numpy()
+
+        group_count_model = pd.Series(y).value_counts()
+
+        if group_count_model.min() < n_splits:
+            st.warning(
+                f"Conjunto {feature_set_name}: o menor grupo tem {group_count_model.min()} participantes. "
+                f"Reduza o número de folds."
+            )
+            continue
+
+        for algorithm_name, algorithm in algorithms.items():
+
+            current_run += 1
+            progress_bar.progress(current_run / total_runs)
+
+            status_text.write(
+                f"Rodando: {feature_set_name} | {algorithm_name}"
+            )
+
+            try:
+                summary, metrics_df, cm_df = evaluate_model_repeated_cv(
+                    X=X,
+                    y=y,
+                    model=algorithm,
+                    positive_label=positive_label,
+                    n_splits=int(n_splits),
+                    n_repeats=int(n_repeats),
+                    n_bootstrap=int(n_bootstrap),
+                    random_state=int(random_state)
+                )
+
+                result_row = {
+                    "Conjunto": feature_set_name,
+                    "Algoritmo": algorithm_name,
+                    "N participantes": model_df.shape[0],
+                    "N variáveis": len(features),
+                    "Balanced accuracy média": summary["balanced_accuracy_mean"],
+                    "Balanced accuracy DP": summary["balanced_accuracy_sd"],
+                    "Balanced accuracy IC95% inferior": summary["balanced_accuracy_ci95_low"],
+                    "Balanced accuracy IC95% superior": summary["balanced_accuracy_ci95_high"],
+                    "Acurácia média": summary["accuracy_mean"],
+                    "Sensibilidade média": summary["sensitivity_mean"],
+                    "Especificidade média": summary["specificity_mean"],
+                    "F1 médio": summary["f1_mean"],
+                    "AUC média": summary["auc_mean"],
+                    "AUC IC95% inferior": summary["auc_ci95_low"],
+                    "AUC IC95% superior": summary["auc_ci95_high"]
+                }
+
+                all_results.append(result_row)
+
+                key = f"{feature_set_name} | {algorithm_name}"
+                detailed_metrics[key] = metrics_df
+                confusion_matrices[key] = cm_df
+
+                final_pipeline, importance_df = fit_final_model_and_importance(
+                    X=X,
+                    y=y,
+                    feature_names=features,
+                    model=algorithm
+                )
+
+                if importance_df is not None:
+                    importances[key] = importance_df
+
+            except Exception as e:
+                st.error(f"Erro em {feature_set_name} | {algorithm_name}")
+                st.exception(e)
+
+    progress_bar.progress(1.0)
+    status_text.write("Análise finalizada.")
+
+    if len(all_results) == 0:
+        st.error("Nenhum modelo foi avaliado com sucesso.")
+        st.stop()
+
+    results_df = pd.DataFrame(all_results)
+
+    results_df = results_df.sort_values(
+        by="Balanced accuracy média",
+        ascending=False
     )
 
-if st.button("Rodar comparação dos modelos classificatórios"):
-    compare_classification_models(wide_df, safe_vars)
+    st.header("7. Ranking dos modelos")
+
+    safe_dataframe(results_df)
+
+    best_row = results_df.iloc[0]
+
+    st.success(
+        f"Melhor modelo: {best_row['Conjunto']} | {best_row['Algoritmo']} "
+        f"com balanced accuracy média = {best_row['Balanced accuracy média']:.3f}"
+    )
+
+    # ========================================================
+    # Gráfico dos melhores modelos
+    # ========================================================
+
+    st.subheader("Top 15 modelos por balanced accuracy")
+
+    top_df = results_df.head(15).copy()
+    top_df["Modelo"] = top_df["Conjunto"] + " | " + top_df["Algoritmo"]
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+
+    ax.barh(
+        top_df["Modelo"][::-1],
+        top_df["Balanced accuracy média"][::-1]
+    )
+
+    ax.set_xlabel("Balanced accuracy média")
+    ax.set_title("Top 15 modelos")
+    ax.set_xlim(0, 1)
+    ax.grid(axis="x", alpha=0.3)
+
+    st.pyplot(fig)
+
+    # ========================================================
+    # Detalhes do melhor modelo
+    # ========================================================
+
+    st.header("8. Detalhes do melhor modelo")
+
+    best_key = f"{best_row['Conjunto']} | {best_row['Algoritmo']}"
+
+    st.subheader("Métricas por fold/repetição do melhor modelo")
+    safe_dataframe(detailed_metrics[best_key])
+
+    st.subheader("Matriz de confusão acumulada do melhor modelo")
+    safe_dataframe(confusion_matrices[best_key])
+
+    if best_key in importances:
+        st.subheader("Importância das variáveis no melhor modelo")
+        safe_dataframe(importances[best_key])
+
+        top_imp = importances[best_key].head(20).copy()
+
+        fig2, ax2 = plt.subplots(figsize=(10, 6))
+
+        ax2.barh(
+            top_imp["Variável"][::-1],
+            top_imp["Importância"][::-1]
+        )
+
+        ax2.set_xlabel("Importância")
+        ax2.set_title("Principais variáveis do melhor modelo")
+        ax2.grid(axis="x", alpha=0.3)
+
+        st.pyplot(fig2)
+
+    else:
+        st.info(
+            "Este algoritmo não possui coeficientes ou importâncias diretas "
+            "de variáveis disponíveis."
+        )
+
+    # ========================================================
+    # Download dos resultados
+    # ========================================================
+
+    st.header("9. Exportar resultados")
+
+    csv_results = results_df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label="Baixar tabela de resultados em CSV",
+        data=csv_results,
+        file_name="resultados_pipeline_ml.csv",
+        mime="text/csv"
+    )
 
 
 # ============================================================
-# Orientação interpretativa
+# Interpretação
 # ============================================================
 
-st.header("7. Como interpretar")
+st.header("10. Como interpretar")
 
 st.markdown(
     """
-### Modelos mistos
+### O que este pipeline responde?
 
-O resultado mais importante é a interação:
+Ele responde principalmente:
 
-`Grupo × Condição`
-
-Se essa interação for significativa, isso sugere que a diferença entre OE e CE
-não é igual nos grupos.
-
-Em termos fisiológicos, isso pode indicar que os pacientes com HIV apresentam
-uma dependência visual diferente para o controle postural.
+> Qual combinação de condição visual, transformação de variáveis e algoritmo
+> separa melhor os grupos?
 
 ---
 
-### Modelos classificatórios
+### Interpretação dos conjuntos de variáveis
 
-A comparação dos modelos deve ser feita principalmente pela **balanced accuracy**.
-
-- Se o modelo **OE** for melhor, olhos abertos já carregam informação suficiente para separar os grupos.
-- Se o modelo **CE** for melhor, a retirada da visão aumenta a separação entre HIV e controles.
-- Se o modelo **OE + CE** for melhor, as duas condições carregam informações complementares.
-- Se o modelo **Delta CE - OE** for melhor, a principal diferença está na resposta à retirada da visão.
-- Se o modelo **Razão CE/OE** for melhor, a informação mais relevante pode estar na mudança relativa entre as condições.
+- **OE**: testa se os grupos já se separam com olhos abertos.
+- **CE**: testa se a retirada da visão aumenta a separação.
+- **OE + CE**: testa se as duas condições trazem informação complementar.
+- **Delta CE - OE**: testa se a resposta à retirada da visão separa os grupos.
+- **Razão CE/OE**: testa se a mudança proporcional separa os grupos.
+- **OE + CE + Delta**: combina valores absolutos e mudança funcional.
 
 ---
 
-### Cuidado importante
+### Métrica principal
 
-A acurácia aparente, calculada no mesmo conjunto usado para treinar o modelo,
-não deve ser usada como principal evidência.
+A métrica principal recomendada é a **balanced accuracy**, especialmente se os
+grupos tiverem tamanhos diferentes.
 
-Por isso, este app usa validação cruzada e mostra a matriz de confusão baseada
-nas predições cruzadas.
+---
+
+### Normalização
+
+A normalização é feita dentro do `Pipeline`, ou seja:
+
+1. o scaler é ajustado apenas no treino;
+2. o teste é transformado usando os parâmetros do treino;
+3. o modelo nunca vê informações do teste durante o treinamento.
+
+Isso evita vazamento de informação.
+
+---
+
+### Bootstrap
+
+O bootstrap é usado para estimar a incerteza das métricas de desempenho,
+gerando intervalos de confiança de 95%.
 """
 )
