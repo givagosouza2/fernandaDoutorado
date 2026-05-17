@@ -383,7 +383,15 @@ def evaluate_model_repeated_cv(
     all_y_true = []
     all_y_pred = []
 
+    fold_counter = 0
+
     for train_idx, test_idx in cv.split(X, y):
+
+        fold_counter += 1
+
+        repeat_number = ((fold_counter - 1) // n_splits) + 1
+        fold_number = ((fold_counter - 1) % n_splits) + 1
+
         X_train = X[train_idx]
         X_test = X[test_idx]
 
@@ -429,6 +437,9 @@ def evaluate_model_repeated_cv(
         )
 
         metrics = {
+            "repeat": repeat_number,
+            "fold": fold_number,
+
             "train_accuracy": train_accuracy,
             "train_balanced_accuracy": train_balanced_accuracy,
 
@@ -544,6 +555,17 @@ def classify_overfitting(gap):
         return "Moderado"
 
     return "Alto"
+
+
+def clean_filename(text):
+    text = str(text)
+    text = text.replace(" ", "_")
+    text = text.replace("/", "_")
+    text = text.replace("\\", "_")
+    text = text.replace("+", "mais")
+    text = text.replace("-", "_")
+    text = text.replace("__", "_")
+    return text
 
 
 # ============================================================
@@ -823,6 +845,7 @@ if st.button("Rodar análise selecionada"):
     )
 
     summary_rows = []
+    all_metrics_rows = []
 
     progress_bar = st.progress(0)
 
@@ -868,6 +891,14 @@ if st.button("Rodar análise selecionada"):
             random_state=int(random_state)
         )
 
+        metrics_export_df = metrics_df.copy()
+        metrics_export_df["Algoritmo"] = algorithm_name
+        metrics_export_df["Conjunto"] = feature_set_name
+        metrics_export_df["N participantes"] = model_df.shape[0]
+        metrics_export_df["N variáveis"] = len(features)
+
+        all_metrics_rows.append(metrics_export_df)
+
         gap_balanced = summary["generalization_gap_balanced_accuracy_mean"]
 
         row = {
@@ -909,7 +940,21 @@ if st.button("Rodar análise selecionada"):
         safe_dataframe(cm_df)
 
         st.write("Métricas por fold/repetição:")
-        safe_dataframe(metrics_df)
+        safe_dataframe(metrics_export_df)
+
+        metrics_csv = metrics_export_df.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label=f"Baixar métricas CV - {feature_set_name}",
+            data=metrics_csv,
+            file_name=(
+                f"metricas_cv_"
+                f"{clean_filename(algorithm_name)}_"
+                f"{clean_filename(feature_set_name)}.csv"
+            ),
+            mime="text/csv",
+            key=f"download_metrics_{clean_filename(algorithm_name)}_{clean_filename(feature_set_name)}"
+        )
 
         importance_df = fit_final_model_and_importance(
             X=X,
@@ -945,6 +990,39 @@ if st.button("Rodar análise selecionada"):
 
         st.header("8. Resumo comparativo da rodada")
         safe_dataframe(summary_df)
+
+        # ====================================================
+        # Download do resumo da rodada
+        # ====================================================
+
+        csv_results = summary_df.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="Baixar resumo da rodada em CSV",
+            data=csv_results,
+            file_name=f"resumo_rodada_{clean_filename(algorithm_name)}.csv",
+            mime="text/csv"
+        )
+
+        # ====================================================
+        # Download de todas as métricas por fold/repetição
+        # ====================================================
+
+        if len(all_metrics_rows) > 0:
+
+            all_metrics_df = pd.concat(all_metrics_rows, ignore_index=True)
+
+            st.subheader("Todas as métricas por fold/repetição da rodada")
+            safe_dataframe(all_metrics_df)
+
+            all_metrics_csv = all_metrics_df.to_csv(index=False).encode("utf-8")
+
+            st.download_button(
+                label="Baixar todas as métricas de cross-validation da rodada",
+                data=all_metrics_csv,
+                file_name=f"metricas_cv_completas_{clean_filename(algorithm_name)}.csv",
+                mime="text/csv"
+            )
 
         # ====================================================
         # Gráfico: desempenho no teste
@@ -1023,15 +1101,6 @@ if st.button("Rodar análise selecionada"):
 
         st.pyplot(fig4)
 
-        csv_results = summary_df.to_csv(index=False).encode("utf-8")
-
-        st.download_button(
-            label="Baixar resultados desta rodada em CSV",
-            data=csv_results,
-            file_name=f"resultados_{algorithm_name.replace(' ', '_')}.csv",
-            mime="text/csv"
-        )
-
 
 # ============================================================
 # Orientação
@@ -1066,6 +1135,21 @@ Sugestão prática:
 5. Quando encontrar os melhores candidatos, aumente apenas neles:
    - 30 ou 50 repetições
    - 1000 bootstraps
+
+---
+
+### Arquivos exportados
+
+O aplicativo permite baixar:
+
+1. **Resumo da rodada**  
+   Contém o desempenho médio de cada conjunto de variáveis.
+
+2. **Métricas por fold/repetição de cada conjunto**  
+   Contém cada resultado individual da validação cruzada.
+
+3. **Todas as métricas da rodada em um único CSV**  
+   Útil para fazer boxplots, comparar algoritmos ou analisar estabilidade.
 
 ---
 
